@@ -2450,6 +2450,33 @@ def _docstring_render_sample() -> str:
     return "\n".join(ln[4:] if ln.startswith("    ") else ln for ln in block).rstrip("\n")
 
 
+def _sample_t1_entry():
+    """The sample's T1 row, as an INPUT. Defined once and shared by the render
+    helper and the candidate-predicate premise pin — two spellings of the same
+    fixture would let the pin drift away from the thing it guards."""
+    from alfred.tier.compute import TierEntry
+
+    return TierEntry(
+        tier=1, origin="task", name="Steph Yang ROE",
+        path="task/Steph Yang ROE.md", due_iso="2026-08-12",
+        surface_reason="due today", source="auto-due", confirmed=None,
+    )
+
+
+def _sample_committed_entry():
+    """The sample's operator-committed routine row — the NEAREST ADMISSIBLE
+    NEIGHBOUR of the T1 row above, and the positive control for any assertion
+    about the candidate predicate."""
+    from alfred.tier.compute import TierEntry
+
+    return TierEntry(
+        tier=2, origin="routine_item", name="Water the plants",
+        path="routine/Weekly Chores.md", due_iso="2026-08-14",
+        source="operator", routine_record="Weekly Chores",
+        item_text="Water the plants", has_due_pattern=True,
+    )
+
+
 def _production_render_of_the_sample() -> str:
     """Re-run the exact projection the module docstring documents, through
     the real emitters, composed by ``render_tier_section``'s own literal."""
@@ -2462,22 +2489,13 @@ def _production_render_of_the_sample() -> str:
     )
     from alfred.tier.day_plan import RolloverRef, build_day_plan
 
-    steph = TierEntry(
-        tier=1, origin="task", name="Steph Yang ROE",
-        path="task/Steph Yang ROE.md", due_iso="2026-08-12",
-        surface_reason="due today", source="auto-due", confirmed=None,
-    )
+    steph = _sample_t1_entry()
     qbo = TierEntry(
         tier=2, origin="task", name="Connect QBO API — RRTS",
         path="task/Connect QBO API — RRTS.md", due_iso="2026-08-11",
         source="operator",
     )
-    plants = TierEntry(
-        tier=2, origin="routine_item", name="Water the plants",
-        path="routine/Weekly Chores.md", due_iso="2026-08-14",
-        source="operator", routine_record="Weekly Chores",
-        item_text="Water the plants", has_due_pattern=True,
-    )
+    plants = _sample_committed_entry()
     anchor = RoutineLine(
         text="Morning pages", priority="normal",
         annotation="*(3d since last; target every 5d)*",
@@ -2539,16 +2557,32 @@ def test_module_docstring_sample_is_byte_identical_to_the_emitters() -> None:
     # PREMISE PIN — this comparison reaches OUTSIDE brief/ and tier/.
     # ``build_day_plan`` asks ``feed_producer._slot_is_candidate`` whether a
     # row is an offer, and the answer decides BOTH the Steph row's confirm
-    # affordance and its position (suggestions sort last). So a change to the
-    # feed's candidate-source set silently rewrites this docstring's sample.
-    # Asserted here by name so that arrives as a diagnosis instead of an
-    # unexplained byte diff.
-    from alfred.brief.feed_producer import _AUTO_CANDIDATE_SOURCES
-    assert "auto-due" in _AUTO_CANDIDATE_SOURCES, (
-        "the feed's candidate-source set no longer contains 'auto-due' — the "
-        "sample's T1 row stops being an offer, loses its confirm affordance "
-        "and moves out of the suggestions bucket. RE-DERIVE the module "
-        "docstring's block; do not edit it toward green."
+    # affordance and its position (suggestions sort last). So a change on the
+    # feed side silently rewrites this docstring's sample. Asserted here so
+    # that arrives as a diagnosis instead of an unexplained byte diff.
+    #
+    # Pinned on the PREDICATE, not on its configuration. An earlier revision
+    # asserted membership in ``_AUTO_CANDIDATE_SOURCES``, which is only half
+    # of ``source in _AUTO_CANDIDATE_SOURCES and confirmed is not True`` — a
+    # change to the ``confirmed`` half would have produced exactly the mystery
+    # this pin exists to prevent. Driving the real predicate over the real
+    # entry covers every path through it.
+    from alfred.tier.day_plan import _is_candidate
+    t1_entry = _sample_t1_entry()
+    assert _is_candidate(t1_entry) is True, (
+        "the feed's candidate predicate no longer treats the sample's T1 row "
+        f"(source={t1_entry.source!r}, confirmed={t1_entry.confirmed!r}) as an "
+        "offer. That row stops carrying its confirm affordance AND moves out "
+        "of the suggestions bucket, so both the sample's text and its ROW "
+        "ORDER change. RE-DERIVE the module docstring's block from the "
+        "emitters; do not edit it toward green."
+    )
+    # CONTROL — the predicate is not a constant True. A committed row (the
+    # plants row's provenance) must come back False, or the assert above
+    # would pass against a predicate that answers "offer" to everything.
+    assert _is_candidate(_sample_committed_entry()) is False, (
+        "CONTROL FAILED: _is_candidate answered True for an operator-committed "
+        "row, so the assertion above proves nothing"
     )
 
     sample = _docstring_render_sample()
@@ -2559,7 +2593,31 @@ def test_module_docstring_sample_is_byte_identical_to_the_emitters() -> None:
     assert "### Duty" in sample, "extractor did not capture the slot headers"
     assert sample.count("\n") > 10, f"sample implausibly short: {sample!r}"
 
-    assert sample == _production_render_of_the_sample()
+    produced = _production_render_of_the_sample()
+    # The remedy sits AT the assertion. A bare `assert a == b` on two long,
+    # near-identical strings gives a maintainer an ellipsised equality whose
+    # sides read the same — the one moved byte is exactly what gets elided.
+    # The unified diff names the moved formatter on the first line of output,
+    # with no -vv needed.
+    import difflib
+    delta = "\n".join(difflib.unified_diff(
+        produced.split("\n"), sample.split("\n"),
+        fromfile="PRODUCTION RENDER (the emitters — correct by construction)",
+        tofile="MODULE DOCSTRING SAMPLE (stale)",
+        lineterm="",
+    ))
+    assert sample == produced, (
+        "the module docstring's render sample no longer matches the emitters. "
+        "A formatter moved; the docstring did not follow it.\n\n"
+        f"{delta}\n\n"
+        "REMEDY: re-derive the block from the emitters (build a TodayView, "
+        "project via build_day_plan, render through render_daily_goal_line + "
+        "_render_day_plan + _render_t2_selection_pool, join by "
+        "render_tier_section's literal) and paste the OUTPUT. Do not hand-edit "
+        "the sample toward green, and do not copy it from vault-talker's "
+        "SKILL.md — copy-propagation between those two surfaces is what "
+        "produced the defects this pin exists to stop."
+    )
 
 
 def test_module_docstring_sample_rows_classify_where_they_are_printed() -> None:

@@ -339,26 +339,48 @@ def _edit(rtype: str, sc: str | None, extra_fm: str = "", **kwargs):
 # operator would plausibly park a directive on (a transcript, a learning
 # atom, an operator-canonical commitment, a rendered-body record).
 #
-# NO body_insert_at row is driven ANYWHERE in this file. That surface
-# appears here only in prose and in the SKILL-absence premise check below;
-# there is no ``body_insert_at=`` kwarg in any drive. An earlier revision of
-# this comment claimed "plus one body_insert_at row in the earlier
-# enumeration" — false, and self-contradicting, since "5 of 26" is the right
-# arithmetic only if no such row exists. Worth naming plainly: a comment
-# written to state coverage HONESTLY is exactly where this lane's own defect
-# class landed, so it now gets the same treatment as the pins it describes —
-# every figure in it was recounted against the file and the registry rather
-# than read. (13 = len(_BODY_MUTATE_DENIED_TYPES); 5 = len(_DENIED), each a
-# member of it; both pinned in the premise test below.)
+# NO body_insert_at row is driven ANYWHERE in this file — that is the
+# behaviour claim, and it is the durable one: there is no ``body_insert_at=``
+# kwarg in any drive, and every ``_edit()`` call site passes
+# ``body_replace="NEW"``. The surface appears here only in prose and in the
+# SKILL-absence premise check below. (CENSUS, WITH ITS FRAME, because a count
+# without one is not checkable: ``grep -c body_insert_at
+# tests/test_instructor_scope_truth.py`` = 4 at c01d119d and 6 at d676491b —
+# this comment's own two new mentions are the difference. The behaviour claim
+# above is what does not drift; the count is a fact about a tree.)
+#
+# An earlier revision of this comment claimed "plus one body_insert_at row in
+# the earlier enumeration" — false, and self-contradicting, since "5 of 26" is
+# the right arithmetic only if no such row exists. Worth naming plainly: a
+# comment written to state coverage HONESTLY is exactly where this lane's own
+# defect class landed. (13 = len(_BODY_MUTATE_DENIED_TYPES); 5 = len(_DENIED),
+# each a member of it; both pinned in the premise test below.)
 #
 # The remaining combinations are covered by the same single code path:
 # ``_check_body_mutation_allowed``'s membership test against that frozenset.
-# That path does carry one per-type branch (``clinical_note``, itself a
-# deny-set member), but it is gated on ``scope == "stayc_clinical"``, so
-# under ``scope="instructor"`` it falls through to the same universal deny as
-# every other member. Widen here if a per-type branch ever becomes REACHABLE
-# FROM THIS SCOPE. This is UNDER-PINNING BY CHOICE, not a claim that only 5
-# are refused.
+# That path carries TWO per-type branches, not one. An earlier revision of
+# this comment said one, because it was found by READING the function; an AST
+# sweep for ``record_type ==`` comparisons inside it finds both:
+#
+#   * the ``clinical_note`` branch — itself a deny-set member, but gated on
+#     ``scope == "stayc_clinical"``, so under ``scope="instructor"`` it falls
+#     through to the same universal deny as every other member.
+#   * the GCal-mirror ``event`` carve-out — and this one is scope-UNGATED;
+#     the function's own docstring names ``instructor`` in that rule.
+#
+# THE CONCLUSION SURVIVES, and it is worth saying why rather than just
+# asserting it: ``event`` is not one of the 13 (driven — ``"event" in
+# _BODY_MUTATE_DENIED_TYPES`` is False), so it cannot be one of the 26
+# combinations this comment is scoping, and the 5-of-26 arithmetic is
+# untouched. The enumeration was wrong; the number it supports was not.
+# (Both branches located at c01d119d..d676491b, where they sit at scope.py
+# L449 and L530 — the coordinates trail the invariant deliberately, since a
+# line number in a comment is a fact with an expiry date and the branch
+# identities are not.)
+#
+# Widen here if a per-type branch ever becomes reachable FROM THIS SCOPE on a
+# type that IS in the 13. This is UNDER-PINNING BY CHOICE, not a claim that
+# only 5 are refused.
 _DENIED = ["session", "conversation", "decision", "preference", "routine"]
 
 

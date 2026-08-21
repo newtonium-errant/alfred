@@ -146,11 +146,19 @@ BLOCK-LEVEL claims — the ones no per-row drive can see:
   * ROW ORDER inside a slot is **carryover → committed → suggestions**
     (``SlotGroup.rows``), NOT tier order and not authoring order. That is why
     the carried ``[T2]`` prints ABOVE the ``[T1]`` candidate: the thing that
-    already cost a day leads, and the yes/no offers come last. Rounds 1 and 2
-    BOTH printed the ``[T1]`` candidate above the ``[T2]`` carryover — round 1
-    with two rows in this slot, round 2 with three — so the order defect
-    survived the round that ADDED a row to the slot without being noticed. An
-    ordering bug is invisible to a per-row check by construction, at any
+    already cost a day leads, and the yes/no offers come last.
+
+    The history here is stated in SHAs rather than in "rounds", because TWO
+    successive corrections to this very bullet were each wrong about which
+    round was which — the labels are the part that kept being false, so they
+    are gone. Measured: at ``50f05b73^`` this slot held 2 rows (the plants row
+    sat under Rhythm); ``50f05b73`` moved plants in, making it 3 in tier
+    order; and ``c01d119d`` is byte-identical to ``50f05b73`` on this file
+    (``git log 50f05b73..c01d119d -- src/alfred/brief/tier_section.py`` is
+    empty). The ``[T1]`` candidate printed above the ``[T2]`` carryover at ALL
+    THREE trees. So the order defect survived the very commit that ADDED a row
+    to this slot — which is the strongest available evidence for the point:
+    an ordering bug is invisible to a per-row check by construction, at any
     length.
   * THE GOAL LINE is :func:`render_daily_goal_line` over
     ``TodayView.daily_goal``; see that function's own docstring for the full
