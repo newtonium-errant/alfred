@@ -167,76 +167,110 @@ def test_unqualified_derivation_names_live_in_tier_section():
     )
 
 
-#: Files whose coordinate citations are KNOWN-STALE and deliberately BOARDED,
-#: not fixed in this lane. The shorthand `:N` continuation form is tolerated
-#: only on a line that also names one of these — and the tolerated count is
-#: pinned below, so the board cannot quietly grow.
-BOARDED_COORDINATE_FILES = ("compute.py", "attachments.py")
-#: 2 on the ``classify_routine_item`` reason-ladder line (compute.py) + 4 on the
-#: per-kind caps line (attachments.py). Deliberately NOT recorded as SKILL line
-#: numbers: this lane exists because coordinates rot, and an earlier draft of
-#: this very comment named lines 432/2845 — which my own edit immediately moved
-#: to 432/2847. The tolerance test keys on the FILE NAMED ON THE LINE, so it is
-#: line-number-independent by construction.
-BOARDED_SHORTHAND_COUNT = 6
+#: THE one coordinate-citation scanner. Both the SKILL scan and the
+#: positive-control fixture below call it, so the fixture exercises the code
+#: that actually guards the SKILL rather than a lookalike regex written
+#: alongside it. Keyed by spelling so a failure names WHICH form reappeared.
+def _find_coordinate_citations(text: str) -> dict[str, list[str]]:
+    hits: dict[str, list[str]] = {}
+    for spelling, pattern in (
+        # any `<path>.py:N` / `<path>.py:N-M` — NOT just tier_section.py.
+        ("full", r"[A-Za-z_][A-Za-z0-9_/]*\.py:\d+(?:-\d+)?"),
+        ("bare", r"\bL\d{2,4}\b"),
+        ("shorthand", r"`:\d+(?:-\d+)?`"),
+    ):
+        found = re.findall(pattern, text)
+        if found:
+            hits[spelling] = found
+    return hits
 
 
-def test_no_line_number_citations_into_tier_section():
-    """The note's citations stay NAME-based — in ALL THREE spellings.
+#: One instance of each spelling the scanner claims to catch. Asserted CAUGHT
+#: below — that is what converts "we enumerate three spellings" from a claim
+#: into a driven fact, and what reds if a regex is ever weakened.
+CITATION_SPELLING_FIXTURES = (
+    ("full", "see `brief/tier_section.py:774` for the composition"),
+    ("bare", "the composition literal (L707) joins the parts"),
+    ("shorthand", "and `due today` at `:592` on the same ladder"),
+)
 
-    This SKILL writes coordinates three different ways, and an earlier version
-    of this pin only knew one of them:
 
-      * full     ``brief/tier_section.py:774``   (4 instances at master)
-      * bare     ``(L707)``                      (18 at master — the DOMINANT form)
-      * shorthand ``` `:592` ```                 (6, all on boarded-file lines)
+def test_no_coordinate_citations_anywhere_in_the_talker_skill():
+    """Citations stay NAME-based — in ALL THREE spellings, for EVERY file.
 
-    A pin bound to the full form alone passes while the bare form — the one
-    this SKILL actually preferred — walks straight through.
+    This SKILL writes coordinates three different ways, and each previous
+    version of this pin was bound narrower than the referent it named:
+
+      * full     ``brief/tier_section.py:774``
+      * bare     ``(L707)``                      (once the DOMINANT form)
+      * shorthand ``` `:592` ```
+
+    Two widenings, each paid for by a real miss. First, a pin bound to the
+    full form alone passed while the bare form walked straight through.
+    Second — this round — the full-form regex was bound to ``tier_section.py``
+    while the SKILL carried coordinates into EIGHT other files and none at all
+    into ``tier_section.py``, so the pin was watching the one door nothing was
+    coming through. Measured at ``c4983e20``, and mind the BOUND on the
+    figure: **28 IN THE THREE SPELLINGS THIS SCANNER ENUMERATES** — 22
+    full-form across those eight files, plus 6 shorthand — of which 16
+    pointed into ``telegram/attachments.py`` and ``telegram/bot.py``, both
+    DELETED (12 full-form + 4 shorthand).
+
+    Under the full REFERENT the baseline was **29, with 17 into deleted
+    files**. The 29th wore a FOURTH spelling this scanner does not catch: a
+    parenthesised ``(lines 7-12)`` trailing a backticked path to the deleted
+    ``attachments.py``. The 2026-08-21 sweep removed it along with the
+    paragraph it sat in, so the file is clean under the referent and not
+    merely under these regexes — but it is a live demonstration that the
+    KNOWN LIMIT below is real rather than ceremonial, found by a gate widening
+    the net AFTER the three-spelling sweep reported zero. Quote the 28 only
+    with "in three spellings" attached, or quote the 29.
+
+    Re-measuring the FILES yields NINE path spellings rather than eight:
+    ``compute.py`` and ``tier/compute.py`` are the same file cited two ways —
+    itself a small argument for names over paths. A pin bound to one filename
+    cannot see a citation into a file that no longer exists, which is the case
+    that most needs seeing.
+
+    The board is gone with them. It previously tolerated 6 shorthand hits on
+    ``compute.py``/``attachments.py`` lines; the 2026-08-21 sweep cleared
+    every one, so the tolerance is now ZERO and any shorthand is a failure.
 
     KNOWN LIMIT, stated rather than papered over. Markdown has no AST, so a
-    coordinate here IS a textual form and this pin can only enumerate the forms
-    that exist. It binds to three. A FOURTH spelling — ``line 774``,
-    ``#L774``, ``at 774`` — would evade it exactly as the bare form evaded the
-    previous version. That is the same failure one level up, and naming it is
-    the only honest guard available: if you add a citation style to this SKILL,
-    add it here in the same commit. The referent is "a coordinate into
-    tier_section.py, however written"; the three regexes below are an
-    enumeration of that referent, not a definition of it.
+    coordinate here IS a textual form and this pin can only enumerate the
+    forms that exist. It binds to three. A FOURTH spelling — ``line 774``,
+    ``#L774``, ``at 774`` — would evade it exactly as the bare form evaded
+    the first version and as a foreign filename evaded the second. Naming
+    that is the only honest guard available: if you add a citation style to
+    this SKILL, add it to the scanner in the same commit. The referent is
+    "a coordinate into a source file, however written"; the three patterns
+    are an enumeration of that referent, not a definition of it.
     """
-    text = _skill_text()
-
-    full = re.findall(r"tier_section\.py:\d+", text)
-    assert not full, (
-        f"full-form coordinates into tier_section.py reappeared: {full}. "
-        "Cite the CONSTRUCT, not the coordinate."
+    found = _find_coordinate_citations(_skill_text())
+    assert not found, (
+        "coordinate citations reappeared in the talker SKILL: "
+        f"{found}. A cross-file line number is a fact with an expiry date, "
+        "and Salem cannot check one — it has no shell and vault_search "
+        "searches the VAULT, not src/. Cite the CONSTRUCT."
     )
 
-    bare = re.findall(r"\bL\d{2,4}\b", text)
-    assert not bare, (
-        f"bare L<N> coordinates reappeared in the talker SKILL: {bare}. "
-        "This was the dominant form before the 2026-08-21 sweep and is the "
-        "one a full-form-only pin misses. Cite the CONSTRUCT."
-    )
 
-    # Shorthand `:N` is legitimate ONLY as a continuation of an explicit
-    # citation to a BOARDED file on the same line.
-    stray, tolerated = [], 0
-    for i, line in enumerate(text.splitlines(), 1):
-        for m in re.finditer(r"`:\d+(?:-\d+)?`", line):
-            if any(f in line for f in BOARDED_COORDINATE_FILES):
-                tolerated += 1
-            else:
-                stray.append(f"SKILL L{i}: {m.group(0)}")
-    assert not stray, (
-        f"shorthand `:N` coordinates outside the boarded files: {stray}. "
-        "Cite the CONSTRUCT."
-    )
-    assert tolerated == BOARDED_SHORTHAND_COUNT, (
-        f"boarded shorthand count moved: expected {BOARDED_SHORTHAND_COUNT}, "
-        f"found {tolerated}. If the boarded sweep landed, LOWER the constant; "
-        "if this grew, a new coordinate was added under cover of the board."
-    )
+def test_the_citation_scanner_catches_every_spelling_it_claims():
+    """Positive control: drive one sample of each spelling through the scanner.
+
+    Without this, ``test_no_coordinate_citations_anywhere_in_the_talker_skill``
+    passing is consistent with three dead regexes — a clean signal that would
+    look identical with the protection removed. This is the check that would
+    have exposed the under-bound version on day one, so it asserts CAUGHT
+    rather than merely asserting the SKILL is clean.
+    """
+    for spelling, sample in CITATION_SPELLING_FIXTURES:
+        hits = _find_coordinate_citations(sample)
+        assert spelling in hits, (
+            f"the {spelling!r} citation spelling is NO LONGER CAUGHT by the "
+            f"scanner (sample: {sample!r}). A regex was weakened or dropped; "
+            "the SKILL scan above is now passing vacuously for this form."
+        )
 
 
 # --------------------------------------------------------------------------
