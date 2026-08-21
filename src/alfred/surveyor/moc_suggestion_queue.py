@@ -77,10 +77,17 @@ def derive_default_queue_path(state_path: str | Path) -> Path:
     return parent / "moc_suggestions.jsonl"
 
 
-def resolve_queue_path(
+def derive_queue_path(
     *, explicit: str | None, state_path: str | Path | None,
 ) -> Path | None:
     """THE derivation of the queue file, for every side that touches it.
+
+    NAMED ``derive_*`` rather than ``resolve_queue_path`` deliberately:
+    ``alfred.telegram.voice_train`` already exports a ``resolve_queue_path``
+    for an unrelated queue (voice-training extractions), and ``alfred.cli``
+    imports THAT one unqualified. Two functions with one name about two
+    different queues would make every future grep for it a referent question
+    and would let an unqualified import of one shadow the other.
 
     Three sides read this queue and they must land on ONE file: the surveyor
     daemon that ENQUEUES (Stage 8), the brief that DEALS the cards, and the act
@@ -458,7 +465,7 @@ def _rewrite_locked(queue_path: Path, entries: list[MocSuggestion]) -> None:
 
 __all__ = [
     "derive_default_queue_path",
-    "resolve_queue_path",
+    "derive_queue_path",
     "load_queue",
     "upsert_proposals",
     "update_status",

@@ -1380,7 +1380,7 @@ class Daemon:
             propose_moc_suggestions,
         )
         from .moc_suggestion_queue import (
-            resolve_queue_path,
+            derive_queue_path,
             upsert_proposals,
         )
 
@@ -1389,9 +1389,18 @@ class Daemon:
         # the act router's ledger write resolve through the same function (via
         # ``config.resolve_moc_queue_path``), so the file this stage writes is
         # the file they read by construction rather than by three functions
-        # happening to agree. ``state.path`` always carries a value (its
-        # dataclass default), so this never returns ``None`` here.
-        queue_path = resolve_queue_path(
+        # happening to agree.
+        #
+        # ``state.path`` carries a dataclass default, so this resolves for
+        # every config an operator is likely to write. It is NOT a guarantee:
+        # an explicitly blanked ``surveyor.state.path`` yields ``None`` here,
+        # and the ``upsert_proposals`` call below is inside this stage's
+        # try/except, so that lands as a logged stage failure rather than a
+        # crash. The predecessor of this line silently wrote the queue to a
+        # CWD-relative file in that case, which on a box where every instance
+        # shares one working directory is one queue for all of them — failing
+        # is the better of the two.
+        queue_path = derive_queue_path(
             explicit=cfg.queue_path, state_path=self.cfg.state.path,
         )
 

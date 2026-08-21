@@ -401,12 +401,12 @@ def resolve_moc_queue_path(raw: dict | None) -> Path | None:
         return None
     if not isinstance(raw.get("surveyor"), dict):
         return None
-    from .moc_suggestion_queue import resolve_queue_path
+    from .moc_suggestion_queue import derive_queue_path
 
     tool = _walk_and_substitute(raw).get("surveyor") or {}
     moc = _build_dataclass(MocSuggestionConfig, tool.get("moc_suggestion"))
     state = _build_dataclass(StateConfig, tool.get("state"))
-    return resolve_queue_path(explicit=moc.queue_path, state_path=state.path)
+    return derive_queue_path(explicit=moc.queue_path, state_path=state.path)
 
 
 def load_from_unified(raw: dict) -> PipelineConfig:

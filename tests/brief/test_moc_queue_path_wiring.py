@@ -138,7 +138,7 @@ def test_resolved_path_matches_the_surveyors_own_enqueue_derivation(
     which is the only process that creates a row. The expectation here is
     rebuilt from the surveyor's FULL typed config by a literal spelling of the
     sibling-file convention, so it is independent of the helper under test:
-    if ``resolve_queue_path`` and the surveyor's state config ever drift, this
+    if ``derive_queue_path`` and the surveyor's state config ever drift, this
     goes red while the same-file pin above stays green.
     """
     state_path = tmp_path / "instance-data" / "surveyor_state.json"
@@ -238,6 +238,35 @@ def test_no_surveyor_block_resolves_to_none_but_a_real_one_does_not(
     assert resolve_moc_queue_path(with_block) is not None
     assert _moc_queue_path_for(load_brief(with_block)) is not None
     assert _moc_queue_path(load_ds(with_block)) is not None
+
+
+def test_the_two_degenerate_surveyor_block_shapes(tmp_path: Path) -> None:
+    """The rest of the enumeration: block-present-but-empty, and bare key.
+
+    Named because a coverage claim is a claim about a SET. ``surveyor: {}``
+    and a bare ``surveyor:`` (which YAML parses to ``None``) are the two
+    shapes the fixtures above do not produce, and they must answer
+    differently:
+
+    * ``{}`` — the block IS there, so the surveyor runs on pure defaults and
+      enqueues at the default state path's sibling. The readers must agree,
+      or they would report "no queue" about one being written.
+    * bare key — parses to ``None``. The surveyor's OWN loader raises
+      ``AttributeError`` on this shape (it does ``raw.get("surveyor", {})``,
+      which returns ``None``, then calls ``.get`` on it), so the instance
+      cannot be enqueueing at all and ``None`` is the honest answer. Pinned
+      alongside so the asymmetry is deliberate rather than incidental.
+    """
+    assert resolve_moc_queue_path({"surveyor": {}}) == (
+        Path(SURVEYOR_STATE_DEFAULT).parent / QUEUE_FILENAME
+    )
+    assert resolve_moc_queue_path(yaml.safe_load("surveyor:\n")) is None
+
+    # The premise for the bare-key branch, checked rather than asserted.
+    with pytest.raises(AttributeError):
+        load_surveyor(yaml.safe_load(
+            f"surveyor:\nvault:\n  path: {tmp_path}\n",
+        ))
 
 
 def test_env_substitution_is_applied_to_the_state_path(

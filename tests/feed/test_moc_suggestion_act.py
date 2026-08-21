@@ -1072,7 +1072,7 @@ def test_the_brief_deals_from_the_file_the_surveyor_writes(tmp_path: Path) -> No
     from alfred.brief.daemon import _emit_moc_suggestions
     from alfred.daily_sync.config import load_from_unified as load_ds
     from alfred.surveyor.config import load_from_unified as load_surveyor
-    from alfred.surveyor.moc_suggestion_queue import resolve_queue_path
+    from alfred.surveyor.moc_suggestion_queue import derive_queue_path
 
     vault = _vault(tmp_path)
     target = _moc(vault, "Roman Philosophy MOC")
@@ -1094,7 +1094,7 @@ def test_the_brief_deals_from_the_file_the_surveyor_writes(tmp_path: Path) -> No
     # Where the SURVEYOR would enqueue, derived from the surveyor's own typed
     # config — not from either consumer's view of it.
     sv = load_surveyor(raw)
-    queue = resolve_queue_path(
+    queue = derive_queue_path(
         explicit=sv.moc_suggestion.queue_path, state_path=sv.state.path,
     )
     queue.parent.mkdir(parents=True, exist_ok=True)
