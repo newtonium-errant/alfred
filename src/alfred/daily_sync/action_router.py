@@ -270,6 +270,14 @@ MOC_APPLY_ACTION = "moc_apply"
 # section produced it". A wording proposal has no capture section, so borrowing
 # it would drag a meaningless picker onto the card. Shape is not meaning.
 CALIBRATION_KIND = KIND_CALIBRATION
+#: NOT the same thing as ``vault.scope.CALIBRATION_APPLY_SCOPE`` (scope.py),
+#: despite the shared words. This is a FEED VERB ID — a member of the
+#: ``FEED_ACTIONS`` capability ceiling, matched against an inbound act's
+#: ``action_id``. That is a VAULT SCOPE NAME, matched against ``SCOPE_RULES``
+#: when the write finally happens. Two registries, two match sites, no code path
+#: compares them, and neither would do the other's job if swapped. They are
+#: parallel names for the two ends of one feature — the tap and the write — and
+#: the parallelism is deliberate; an equivalence between them is not.
 CALIBRATION_APPLY_ACTION = "calibration_apply"
 CALIBRATION_DISCARD_ACTION = "calibration_discard"
 

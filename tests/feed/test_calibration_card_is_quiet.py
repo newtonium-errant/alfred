@@ -128,6 +128,21 @@ def test_calibration_verbs_are_not_admitted_for_any_other_kind() -> None:
         assert CALIBRATION_APPLY_ACTION not in verbs, kind
         assert CALIBRATION_DISCARD_ACTION not in verbs, kind
 
-    # And attribution specifically still offers exactly what it did — the kind
+    # And attribution specifically still offers EXACTLY what it did — the kind
     # the ruling named as the one that must not grow buttons.
-    assert set(FEED_ACTIONS["attribution"]) >= {"confirm", "reject", "contest"}
+    #
+    # EQUALITY, not a superset, and the distinction is the whole assertion. The
+    # first version of this line was ``>= {"confirm","reject","contest"}`` under
+    # this same comment: a superset check naming 3 of attribution's 7 verbs,
+    # which PASSES IF ATTRIBUTION GROWS A BUTTON — precisely what the comment
+    # says must not happen. The comment was stronger than the assert, which is
+    # the more dangerous direction, because a reader audits the prose.
+    #
+    # The defers are derived from ``DEFER_ACTIONS`` rather than typed out: they
+    # reach this kind through the ceiling's programmatic auto-fold, so spelling
+    # them here would be a second copy that drifts the day the fold changes.
+    from alfred.daily_sync.action_router import CONTEST_ACTION, DEFER_ACTIONS
+
+    assert set(FEED_ACTIONS["attribution"]) == {
+        "confirm", "reject", CONTEST_ACTION, *DEFER_ACTIONS,
+    }
