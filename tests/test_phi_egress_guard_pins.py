@@ -28,9 +28,10 @@ Python object. Two consequences worth stating:
     ``test_the_hypatia_pin_binds_to_structure_not_the_literal`` is the control
     that proves this pin does not.
     (Deliberately no line numbers: a coordinate into a file this lane also
-    ANNOTATES expires on contact. The first draft of this docstring cited
-    :1107, and the annotations in this same commit moved the entry to :1117 —
-    false before it was ever read. Name the block, not the line.)
+    ANNOTATES expires on contact. The first draft of this docstring cited a
+    line number for the entry, and the annotations in this same commit moved it
+    ten lines down — false before it was ever read. Which is why this docstring
+    names the block, not the line.)
 
 *   They keep working if an operator UNCOMMENTS the block: ``_payload`` strips
     at most one comment marker and returns live lines unchanged.
@@ -62,7 +63,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = REPO_ROOT / "config.yaml.example"
-CONFTEST = Path(__file__).resolve().parent / "conftest.py"
+TESTS_DIR = Path(__file__).resolve().parent
 
 _COMMENT = re.compile(r"^([ \t]*)#[ ]?(.*)$")
 
@@ -222,23 +223,32 @@ def test_clinical_sections_are_unreachable_by_a_sovereign_config():
 # ---------------------------------------------------------------------------
 
 
-def _conftest_fixture_names() -> set[str]:
-    """Fixture names defined in tests/conftest.py, read from the AST.
+def _conftest_fixture_names() -> dict[str, set[str]]:
+    """Fixture names per ``conftest.py`` under ``tests/``, read from the AST.
 
     AST rather than grep: a name in a docstring or a comment is not a fixture,
     and this pin is about what pytest would actually register.
+
+    EVERY conftest, not just the root one: pytest honours a fixture defined in
+    any ``conftest.py`` for the subtree beneath it, so a reintroduction in
+    ``tests/state/`` would be just as live as one in ``tests/`` — and a pin
+    whose denominator is one file cannot see it. The claim is tree-wide, so
+    the walk is too.
     """
-    tree = ast.parse(CONFTEST.read_text(encoding="utf-8"))
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        for dec in node.decorator_list:
-            target = dec.func if isinstance(dec, ast.Call) else dec
-            label = getattr(target, "attr", None) or getattr(target, "id", None)
-            if label == "fixture":
-                names.add(node.name)
-    return names
+    out: dict[str, set[str]] = {}
+    for path in sorted(TESTS_DIR.rglob("conftest.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        names: set[str] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for dec in node.decorator_list:
+                target = dec.func if isinstance(dec, ast.Call) else dec
+                label = getattr(target, "attr", None) or getattr(target, "id", None)
+                if label == "fixture":
+                    names.add(node.name)
+        out[path.relative_to(TESTS_DIR).as_posix()] = names
+    return out
 
 
 def test_ephemeral_config_fixture_stays_deleted():
@@ -256,12 +266,32 @@ def test_ephemeral_config_fixture_stays_deleted():
     do not reintroduce a whole-file ``safe_load`` fixture, which cannot see
     what this module exists to protect.
     """
-    fixtures = _conftest_fixture_names()
+    by_file = _conftest_fixture_names()
 
-    # Positive control on the LIVE path: the same AST lookup finds a fixture
-    # that IS defined and IS requested (904 call sites). Without this, the
-    # assertion below would pass identically if the lookup were broken and
-    # returned an empty set.
-    assert "tmp_vault" in fixtures
+    # The pin's denominator, named rather than counted — a coverage claim
+    # carries its enumeration. If the walk stops finding one of these, that is
+    # a broken instrument, not a clean result.
+    known = {
+        "conftest.py",
+        "health/conftest.py",
+        "orchestrator/conftest.py",
+        "state/conftest.py",
+        "telegram/conftest.py",
+    }
+    assert known <= set(by_file), f"conftest walk lost: {sorted(known - set(by_file))}"
 
-    assert "ephemeral_config" not in fixtures
+    # Positive control 1 — ROOT. The same AST lookup finds a fixture that IS
+    # defined and IS requested: tmp_vault, requested by 242 ``test_`` functions
+    # across 22 files (AST parameter scan over tests/, measured at 36e81949; a
+    # raw occurrence grep reports 906, which counts mentions, not requests).
+    # Without this, the assertion below would pass identically against a broken
+    # lookup that returned nothing.
+    assert "tmp_vault" in by_file["conftest.py"]
+
+    # Positive control 2 — NESTED. Proves the walk actually DESCENDS. Control 1
+    # alone would pass for a walk that only ever read the root conftest, which
+    # is precisely the blind spot this pin was widened to close.
+    assert "state_path" in by_file["state/conftest.py"]
+
+    offenders = {f for f, names in by_file.items() if "ephemeral_config" in names}
+    assert offenders == set(), f"ephemeral_config reintroduced in: {sorted(offenders)}"
