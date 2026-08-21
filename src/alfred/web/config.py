@@ -182,10 +182,22 @@ class WebSttShadowCaptureConfig:
     """Web voice STT shadow-capture (``web.voice.stt.shadow_capture``).
 
     DEFAULT-OFF, Salem-only, additive, fully isolated from the served voice
-    turn (mirrors Telegram's ``SttShadowCaptureConfig``). When ``enabled`` each
+    turn (mirrors Telegram's ``SttShadowCaptureConfig`` — which is RETIRED as of
+    R2 2026-08-20; THIS one is the live shadow path). When ``enabled`` each
     captured utterance runs ONE extra Groq batch call on the fed PCM (the
     Deepgram STREAMING final is already in hand) and appends the audio + both
     transcripts + divergence + a noise tag to a replayable corpus under ``dir``.
+
+    WHY "Salem-only" IS LOAD-BEARING, and why the guards in
+    ``config.yaml.example`` name Hypatia: enabling this egresses raw mic PCM to
+    api.groq.com. All clinical work is STAY-C's — Hypatia is the scholar/scribe
+    instance and is NOT clinical — but the exclusion is defence-in-depth after a
+    REAL 2026-07-08 PHI-egress incident, so do NOT relax it on the strength of
+    "Hypatia isn't clinical". It targets REAL crossover (clinical WORK routed to
+    a non-clinical instance; bulk or systematic PHI reaching cloud), NOT
+    incidental non-work mention, which is an accepted residual at this stage.
+    Full note: "WHY THE SETTINGS NAMING HYPATIA STAY" in ``config.yaml.example``
+    (under ``telegram.stt``).
     """
 
     enabled: bool = False

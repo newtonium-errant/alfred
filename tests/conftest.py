@@ -1,8 +1,8 @@
 """Shared pytest fixtures for the Alfred test suite.
 
 These fixtures are intentionally minimal — they exist to give tests a
-working vault layout and a config dict that mirrors ``config.yaml.example``
-without touching the real vault or the user's checked-in config.
+working vault layout without touching the real vault or the user's
+checked-in config.
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ from textwrap import dedent
 import pytest
 import structlog
 import structlog._config
-import yaml
 
 
 # ---------------------------------------------------------------------------
@@ -236,18 +235,16 @@ def tmp_vault(tmp_path: Path) -> Path:
     return vault
 
 
-@pytest.fixture
-def ephemeral_config(tmp_vault: Path) -> dict:
-    """Load ``config.yaml.example`` and repoint ``vault.path`` at ``tmp_vault``.
-
-    Returns the parsed dict — tests can mutate it freely; nothing is written
-    back to disk.
-    """
-    repo_root = Path(__file__).resolve().parent.parent
-    example = repo_root / "config.yaml.example"
-    raw = yaml.safe_load(example.read_text(encoding="utf-8"))
-    raw.setdefault("vault", {})["path"] = str(tmp_vault)
-    return raw
+# ``ephemeral_config`` was DELETED here (2026-08-21). It loaded
+# ``config.yaml.example`` via ``yaml.safe_load`` and repointed ``vault.path``,
+# and it was requested by NOTHING — one occurrence tree-wide, its own
+# definition, zero executions. It is not merely dead: it read as
+# example-config coverage while being structurally incapable of seeing the
+# PHI-egress guards in that file, which live in COMMENTED blocks that
+# ``yaml.safe_load`` discards. A careful lane took it for coverage and shipped
+# a wrong commit body on the strength of it. Its absence is pinned by
+# ``tests/test_phi_egress_guard_pins.py``; the real commented-block reader
+# lives there too.
 
 
 # ---------------------------------------------------------------------------
