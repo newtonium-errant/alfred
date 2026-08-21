@@ -4,15 +4,29 @@ Item-level CRUD on existing routine records:
 
   - ``alfred routine item add [<record>] <item_text> [--priority X]
     [--target-cadence-days N] [--due-pattern JSON]
-    [--surface-at-days N] [--escalate-at-days N]`` — append new item.
+    [--surface-at-days N] [--escalate-at-days N]
+    [--escalate-after-gap-days N] [--warn-after-gap-days N]
+    [--self-care]`` — append new item.
   - ``alfred routine item remove [<record>] <item_text>`` — delete one
     item by text match. Strips ``completion_log[<item_text>]`` if present.
   - ``alfred routine item edit [<record>] <item_text> [--text NEW]
     [--priority X] [--target-cadence-days N] [--due-pattern JSON]
     [--surface-at-days N] [--escalate-at-days N]
-    [--clear-due-pattern] [--clear-target-cadence-days]`` — mutate one
-    item. Renaming (``--text NEW``) migrates ``completion_log[old] →
-    completion_log[new]`` atomically.
+    [--escalate-after-gap-days N] [--warn-after-gap-days N]
+    [--self-care/--no-self-care] [--clear-due-pattern]
+    [--clear-target-cadence-days] [--clear-escalate-after-gap-days]``
+    — mutate one item. Renaming (``--text NEW``) migrates
+    ``completion_log[old] → completion_log[new]`` atomically.
+
+## The two escalation axes are DIFFERENT fields — do not conflate them
+
+``escalate_at_days`` is days **BEFORE DUE** on a ``due_pattern`` item.
+``escalate_after_gap_days`` is days **SINCE LAST COMPLETION** on an item
+with **no** ``due_pattern``. The names are one word apart and the meanings
+do not overlap; the pair is mutually exclusive and enforced as such below
+(``_check_cadence_conflict_on_add`` / ``_on_edit``). See
+:data:`ITEM_FIELD_SPECS` for the glosses that get quoted back at a caller
+who supplies the wrong one.
 
 Sibling module to ``routine/cli.py`` (which carries B1's ``cmd_done``
 + Phase 1's ``cmd_run_now`` / ``cmd_status``). Split so each module
@@ -75,6 +89,7 @@ at entry. Routine subsystem refuses non-Salem instances.
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 from dataclasses import dataclass
@@ -120,6 +135,346 @@ log = structlog.get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Accepted-field registry — THE single source of truth (2026-08-21)
+# ---------------------------------------------------------------------------
+#
+# WHY THIS TABLE EXISTS. On 2026-08-20 the operator asked for a routine item
+# with a 7-day neglect-gap escalation. The talker's ``routine_item`` dispatcher
+# read a HAND-WRITTEN subset of the ``fields`` dict, so
+# ``escalate_after_gap_days`` — a real, load-bearing, tier-engine-consumed
+# field — was dropped on the floor and the tool reported ``ok=True``. Operator
+# intent was discarded while the reply said "done".
+#
+# The general defect is not the missing field; it is that the SET of writable
+# fields was implicit, duplicated across four layers (argparse, the cli.py
+# dispatch call, the handler kwargs, the talker's argv builder), and enforced
+# by NONE of them. A field present in three of the four is invisible: every
+# layer that does not know about it silently no-ops.
+#
+# This table is the accepted set. It is consumed by:
+#   * :func:`accepted_item_fields` — what the talker dispatcher will accept
+#   * :func:`unsupported_item_fields` — what it must REFUSE BY NAME
+#   * ``conversation._dispatch_routine_item`` — the argv builder itself
+# so acceptance and threading read from ONE list. Adding a field means adding
+# a row here plus its argparse flag and its handler kwarg;
+# ``test_routine_item_field_registry.py`` drives every row through the real
+# dispatcher and fails if a row is not threaded into argv.
+#
+# NOT a substitute for the argparse surface: argparse is what a HUMAN hits at
+# a terminal, and it already refuses unknown ``--flags`` loudly (exit 2). The
+# silent-drop surface was only ever the talker's dict→argv hop, which is what
+# this table gates.
+
+
+@dataclass(frozen=True)
+class ItemFieldSpec:
+    """One field the ``routine_item`` tool accepts, and how to encode it.
+
+    ``name`` is the key in the talker tool's ``fields`` dict (and, for the
+    real item fields, the frontmatter key on the stored item). ``flag`` is
+    the ``alfred routine item`` CLI long flag it serialises to.
+
+    ``encoding`` selects the argv encoder:
+      * ``"value"``     — ``[flag, str(value)]``. The plain scalar class;
+        this is the class that got silently dropped, and it is the one the
+        dispatcher now builds mechanically from this table.
+      * ``"json"``      — dict serialised via ``json.dumps`` (``due_pattern``).
+      * ``"bool_pair"`` — ``--x`` / ``--no-x`` (``self_care``).
+      * ``"switch"``    — bare presence flag when truthy (the ``clear_*``
+        mode-switch opt-ins).
+      * ``"text"``      — the rename control key (``fields.text`` → ``--text``).
+
+    ``meaning`` is a one-line operator-facing gloss. It is NOT decoration: it
+    is quoted verbatim in the refusal message when a caller supplies a
+    near-name, which is the entire fix for the ``escalate_at_days`` vs
+    ``escalate_after_gap_days`` trap — two fields one character-class apart
+    that mean completely different things (days BEFORE DUE vs days SINCE
+    LAST COMPLETION). A refusal that only said "unknown field" would leave
+    the caller to guess between them.
+    """
+
+    name: str
+    flag: str
+    encoding: str
+    actions: frozenset[str]
+    meaning: str
+
+
+_ADD_EDIT = frozenset({"add", "edit"})
+_EDIT_ONLY = frozenset({"edit"})
+
+
+#: THE accepted set. Order is the operator-facing listing order.
+ITEM_FIELD_SPECS: tuple[ItemFieldSpec, ...] = (
+    ItemFieldSpec(
+        name="text", flag="--text", encoding="text", actions=_EDIT_ONLY,
+        meaning="rename the item (migrates its completion_log history)",
+    ),
+    ItemFieldSpec(
+        name="priority", flag="--priority", encoding="value",
+        actions=_ADD_EDIT,
+        meaning="critical / tracked / aspirational",
+    ),
+    ItemFieldSpec(
+        name="target_cadence_days", flag="--target-cadence-days",
+        encoding="value", actions=_ADD_EDIT,
+        meaning=(
+            "SOFT cadence — aim to do it every N days; surfaces quietly in "
+            "T3 at gap >= N and never escalates on its own"
+        ),
+    ),
+    ItemFieldSpec(
+        name="due_pattern", flag="--due-pattern", encoding="json",
+        actions=_ADD_EDIT,
+        meaning=(
+            "HARD deadline shape (weekly/monthly/...); the item is due BY a "
+            "date rather than every N days"
+        ),
+    ),
+    ItemFieldSpec(
+        name="surface_at_days", flag="--surface-at-days", encoding="value",
+        actions=_ADD_EDIT,
+        meaning=(
+            "days BEFORE DUE at which a due_pattern item starts surfacing "
+            "as T2. Requires due_pattern"
+        ),
+    ),
+    ItemFieldSpec(
+        name="escalate_at_days", flag="--escalate-at-days", encoding="value",
+        actions=_ADD_EDIT,
+        meaning=(
+            "days BEFORE DUE at which a due_pattern item escalates to T1 "
+            "(0 = on the due date itself). Requires due_pattern. This is "
+            "the DEADLINE axis"
+        ),
+    ),
+    ItemFieldSpec(
+        name="escalate_after_gap_days", flag="--escalate-after-gap-days",
+        encoding="value", actions=_ADD_EDIT,
+        meaning=(
+            "days SINCE LAST COMPLETION at which a NO-deadline item "
+            "escalates to T1 and visits Duty for the day. Requires NO "
+            "due_pattern. This is the NEGLECT-GAP axis"
+        ),
+    ),
+    ItemFieldSpec(
+        name="warn_after_gap_days", flag="--warn-after-gap-days",
+        encoding="value", actions=_ADD_EDIT,
+        meaning=(
+            "days SINCE LAST COMPLETION at which the routine section "
+            "ANNOTATES the item. Annotation only — never changes its tier"
+        ),
+    ),
+    ItemFieldSpec(
+        name="self_care", flag="--self-care", encoding="bool_pair",
+        actions=_ADD_EDIT,
+        meaning="route the item to the T3 self-care lane",
+    ),
+    ItemFieldSpec(
+        name="clear_due_pattern", flag="--clear-due-pattern",
+        encoding="switch", actions=_EDIT_ONLY,
+        meaning=(
+            "opt-in to strip due_pattern (+ its escalate_at_days / "
+            "surface_at_days knobs) when switching off a hard deadline"
+        ),
+    ),
+    ItemFieldSpec(
+        name="clear_target_cadence_days", flag="--clear-target-cadence-days",
+        encoding="switch", actions=_EDIT_ONLY,
+        meaning="opt-in to strip target_cadence_days when switching soft → hard",
+    ),
+    ItemFieldSpec(
+        name="clear_escalate_after_gap_days",
+        flag="--clear-escalate-after-gap-days",
+        encoding="switch", actions=_EDIT_ONLY,
+        meaning=(
+            "opt-in to strip escalate_after_gap_days when putting a hard "
+            "deadline on an item that had neglect-gap escalation"
+        ),
+    ),
+)
+
+
+#: ``{action: frozenset(field names)}`` — derived, never hand-maintained.
+_ACCEPTED_BY_ACTION: dict[str, frozenset[str]] = {
+    action: frozenset(
+        spec.name for spec in ITEM_FIELD_SPECS if action in spec.actions
+    )
+    for action in ("add", "edit", "remove")
+}
+
+_SPEC_BY_NAME: dict[str, ItemFieldSpec] = {
+    spec.name: spec for spec in ITEM_FIELD_SPECS
+}
+
+
+def accepted_item_fields(action: str) -> frozenset[str]:
+    """Field names the ``routine_item`` tool accepts for ``action``.
+
+    ``remove`` accepts NONE — it takes no fields at all, so any field on a
+    remove call is operator/model confusion worth naming rather than
+    ignoring.
+    """
+    return _ACCEPTED_BY_ACTION.get(action, frozenset())
+
+
+def unsupported_item_fields(action: str, keys: Any) -> list[str]:
+    """Return the sorted subset of ``keys`` this action does NOT accept.
+
+    Empty list == every supplied field is writable. The caller REFUSES on a
+    non-empty result — it must never proceed and report success, which is
+    exactly the 2026-08-20 defect this function exists to prevent.
+    """
+    if not isinstance(keys, dict):
+        return []
+    accepted = accepted_item_fields(action)
+    return sorted(str(k) for k in keys if str(k) not in accepted)
+
+
+#: Field groups whose members are genuinely CONFUSABLE — near-identical
+#: names, non-overlapping meanings. When a refusal's near-name lands inside
+#: one of these, the WHOLE group is spelled out rather than just the top
+#: string-distance match.
+#:
+#: Why this is not left to difflib: string distance answers "which name did
+#: you probably mis-type", and the failure here is not a typo — it is a
+#: caller who knows exactly what they want and reaches for the wrong one of
+#: two similar names. Measured: ``escalate_gap_days`` (a caller plainly
+#: after the GAP axis) scores CLOSEST to ``escalate_at_days``, the DEADLINE
+#: axis. Taking that top match alone would confidently hand back the wrong
+#: field. The group makes the distinction unmissable regardless of scoring.
+_CONFUSABLE_GROUPS: tuple[frozenset[str], ...] = (
+    frozenset({
+        "escalate_at_days",
+        "escalate_after_gap_days",
+        "warn_after_gap_days",
+    }),
+)
+
+
+#: Real ``Item`` fields (``alfred.routine.config.Item``) that this tool
+#: deliberately CANNOT write, with the reason. Every one of these is a
+#: genuine frontmatter field the tier engine reads — they are boarded, not
+#: forgotten, and the refusal says so.
+#:
+#: The bound is mechanical: ``Item.__dataclass_fields__`` minus the accepted
+#: set. ``test_known_unwritable_covers_every_boarded_item_field`` asserts
+#: this dict covers the difference exactly, so a future field added to
+#: ``Item`` and to neither list fails the suite rather than falling into the
+#: generic "unknown field" branch and reading as a typo.
+_KNOWN_UNWRITABLE_FIELDS: dict[str, str] = {
+    "slot": (
+        "it is the operator's own Duty/Rhythm/Fuel ruling and the "
+        "highest-precedence signal the slot classifier has, so writing it "
+        "needs validation against the canonical slot vocabulary that this "
+        "tool does not yet carry."
+    ),
+    "time": (
+        "it is the HH:MM clock time for a critical item, and this tool has "
+        "no time-format validation."
+    ),
+}
+
+
+def _confusable_group_for(field: str) -> frozenset[str]:
+    """The confusable group containing ``field``, or an empty frozenset."""
+    for group in _CONFUSABLE_GROUPS:
+        if field in group:
+            return group
+    return frozenset()
+
+
+def describe_unsupported_field(name: str, action: str) -> str:
+    """Human-readable refusal line for ONE unsupported field name.
+
+    Names the field, and — when a near-name exists in the accepted set —
+    spells out its meaning, plus the meanings of every field in its
+    confusable group. The group branch is the ``escalate_at_days`` /
+    ``escalate_after_gap_days`` trap: the two differ by one word and mean
+    different axes (days-BEFORE-DUE vs days-SINCE-LAST-COMPLETION). Telling
+    a caller only "did you mean escalate_at_days?" would actively invite the
+    wrong one — which is how the original defect stayed plausible for a day.
+    """
+    accepted = sorted(accepted_item_fields(action))
+
+    known_gap = _KNOWN_UNWRITABLE_FIELDS.get(name)
+    if known_gap is not None:
+        # A REAL routine-item field that this tool genuinely cannot write.
+        # Saying only "unknown field" here would be a lie by omission — the
+        # field exists, the operator may well have meant it, and there IS a
+        # path. Naming the path is what stops the model inventing one or
+        # quietly giving up. (Intentionally-left-blank: a known gap must
+        # announce itself as a gap, not as a nonsense name.)
+        return (
+            f"{name!r} IS a real routine-item field but the routine_item "
+            f"tool cannot write it — {known_gap} Nothing was changed. Do "
+            f"not retry through this tool; either use vault_edit on the "
+            f"routine record, or tell the operator this one needs a hand "
+            f"edit."
+        )
+
+    own = _SPEC_BY_NAME.get(name)
+    if own is not None and name not in accepted:
+        # Real field, wrong action (e.g. a clear_* switch on an add). Name
+        # the action, not the field, as the problem — the caller's field
+        # name is correct and telling them otherwise would send them
+        # hunting for a spelling error that isn't there.
+        only = "edit" if "edit" in own.actions else "add"
+        return (
+            f"{name!r} is not accepted on action={action!r} "
+            f"(it is {only}-only) — {own.meaning}."
+        )
+
+    near = difflib.get_close_matches(name, accepted, n=1, cutoff=0.55)
+    if not near:
+        return f"{name!r} is not a field the routine_item tool can write."
+
+    suggestion = near[0]
+    spec = _SPEC_BY_NAME.get(suggestion)
+    gloss = f" — {spec.meaning}" if spec is not None else ""
+    line = (
+        f"{name!r} is not a field the routine_item tool can write. "
+        f"The closest field it DOES accept is {suggestion!r}{gloss}."
+    )
+
+    group = _confusable_group_for(suggestion)
+    others = sorted(
+        f for f in group if f != suggestion and f in accepted
+    )
+    if others:
+        detail = " ".join(
+            f"{f!r} — {_SPEC_BY_NAME[f].meaning}." for f in others
+        )
+        line += (
+            f" CAREFUL — these are easy to confuse and mean different "
+            f"things: {detail} Pick by which question you are answering, "
+            f"not by which name looks closest."
+        )
+    return line
+
+
+def unsupported_fields_message(action: str, unsupported: list[str]) -> str:
+    """Full operator-facing refusal message for a set of unsupported fields.
+
+    Always enumerates the accepted set. A caller told only what is wrong has
+    to guess what is right; the enumeration is what turns this refusal into
+    something the model can immediately retry correctly.
+    """
+    lines = [describe_unsupported_field(n, action) for n in unsupported]
+    accepted = sorted(accepted_item_fields(action))
+    return (
+        f"routine_item refused: {len(unsupported)} field(s) on "
+        f"action={action!r} cannot be written by this tool, so NOTHING was "
+        f"changed. "
+        + " ".join(lines)
+        + f" Fields accepted on action={action!r}: "
+        + (", ".join(accepted) if accepted else "(none — remove takes no fields)")
+        + ". If you need a field that is not on that list, say so plainly "
+        "rather than reporting the change as done."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Field validation primitives
 # ---------------------------------------------------------------------------
 
@@ -153,15 +508,32 @@ def _validate_priority(value: Any) -> tuple[str | None, str | None]:
     return lowered, None
 
 
+#: Fields for which 0 is a MEANINGFUL value, not a no-op.
+#:
+#: ``escalate_at_days: 0`` means "T1 fires on the due date itself" — a real
+#: setting. Every other numeric field treats 0 as undefined semantics and is
+#: rejected below.
+#:
+#: ``escalate_after_gap_days`` is deliberately NOT a member, and the reason is
+#: load-bearing rather than stylistic: ``tier.compute.classify_routine_item``
+#: gates the neglect-gap branch on ``gap_threshold > 0``, so a stored 0 would
+#: be accepted, written to the record, and then silently never fire — the same
+#: shape of silent-drop this commit exists to close, just one layer down.
+#: Pinned by ``test_escalate_after_gap_days_rejects_zero_because_engine_gates_gt_zero``.
+#: A frozenset rather than a ``==`` so a future ``escalate_*`` field cannot
+#: join the zero-allowed class by name-prefix accident.
+_ZERO_VALID_FIELDS: frozenset[str] = frozenset({"escalate_at_days"})
+
+
 def _validate_positive_int(
     value: Any, field_name: str,
 ) -> tuple[int | None, str | None]:
-    """Validate operator-supplied positive-int field
-    (target_cadence_days / surface_at_days / escalate_at_days).
+    """Validate operator-supplied positive-int field (target_cadence_days /
+    surface_at_days / escalate_at_days / escalate_after_gap_days /
+    warn_after_gap_days).
 
-    Returns ``(parsed, error)``. ``escalate_at_days`` may be 0
-    (T1-on-due semantics); ``target_cadence_days`` and
-    ``surface_at_days`` must be > 0. ``field_name`` parameterises
+    Returns ``(parsed, error)``. Fields in :data:`_ZERO_VALID_FIELDS` may be
+    0; every other numeric field must be > 0. ``field_name`` parameterises
     the zero-vs-positive check.
 
     The aggregator's defensive parsing tolerates strings that look
@@ -185,10 +557,10 @@ def _validate_positive_int(
         )
     # escalate_at_days may be 0 (item fires T1 only on the due date
     # itself, Pay-Clinic-Rental shape). target_cadence_days +
-    # surface_at_days must be > 0 (zero/negative produce undefined
-    # semantics — see tier.compute.compute_auto_t3_candidates'
-    # defensive skip on non-positive target).
-    if field_name == "escalate_at_days":
+    # surface_at_days + the two gap fields must be > 0 (zero/negative
+    # produce undefined semantics — see tier.compute's defensive skip on
+    # non-positive target, and its ``gap_threshold > 0`` gate).
+    if field_name in _ZERO_VALID_FIELDS:
         if parsed < 0:
             return None, (
                 f"{field_name} must be >= 0 (got {parsed}); "
@@ -643,6 +1015,8 @@ def _validate_field_bundle(
     target_cadence_days: Any = None,
     surface_at_days: Any = None,
     escalate_at_days: Any = None,
+    escalate_after_gap_days: Any = None,
+    warn_after_gap_days: Any = None,
     due_pattern: Any = None,
     self_care: Any = None,
 ) -> tuple[dict, str | None]:
@@ -670,6 +1044,11 @@ def _validate_field_bundle(
         ("target_cadence_days", target_cadence_days),
         ("surface_at_days", surface_at_days),
         ("escalate_at_days", escalate_at_days),
+        # FUEL-ESCALATION write side (2026-08-21). The NEGLECT-GAP axis —
+        # days SINCE LAST COMPLETION — NOT to be confused with
+        # ``escalate_at_days`` two lines up, which is days BEFORE DUE.
+        ("escalate_after_gap_days", escalate_after_gap_days),
+        ("warn_after_gap_days", warn_after_gap_days),
     ):
         parsed, err = _validate_positive_int(value, name)
         if err is not None:
@@ -719,6 +1098,34 @@ def _check_cadence_conflict_on_add(
             "SOFT-vs-HARD discrimination table in the SKILL's "
             "'Adjusting routines' section."
         )
+    # NEGLECT-GAP axis vs the DEADLINE axis (2026-08-21). Same
+    # write-time-not-read-time enforcement as the pair above, and the same
+    # rationale as the read side: a raw completion gap is undefined under a
+    # deadline item's cycle-based doneness, so the tier engine ignores the
+    # gap field and flags ``gap_escalation_conflict``
+    # (``tier.compute.classify_routine_item``). Refusing at write time means
+    # the operator hears about it now, rather than the field sitting inert
+    # on the record forever.
+    #
+    # NOTE what is deliberately ABSENT: ``escalate_after_gap_days`` +
+    # ``target_cadence_days`` is NOT a conflict. Those two COMPOSE and are
+    # the common shape — a quiet daily cadence that turns into a Duty visit
+    # once neglected (the operator's Pool Chemistry ask is exactly this).
+    # Pinned by ``test_gap_escalation_composes_with_target_cadence_on_add``.
+    if (
+        new_fields.get("escalate_after_gap_days") is not None
+        and new_fields.get("due_pattern") is not None
+    ):
+        return (
+            "Cannot set both ``escalate_after_gap_days`` (neglect-gap "
+            "escalation — days SINCE LAST COMPLETION) and ``due_pattern`` "
+            "(a hard deadline) on the same item. A completion gap is "
+            "undefined under a deadline item's cycle-based doneness, so "
+            "the tier engine would ignore the gap field entirely. If you "
+            "want deadline escalation, use ``escalate_at_days`` (days "
+            "BEFORE DUE) instead — that is the due-axis field and it is a "
+            "DIFFERENT question from the gap axis."
+        )
     return None
 
 
@@ -728,6 +1135,7 @@ def _check_cadence_conflict_on_edit(
     *,
     clear_due_pattern: bool,
     clear_target_cadence_days: bool,
+    clear_escalate_after_gap_days: bool = False,
 ) -> str | None:
     """Reject ``edit`` when the operator's change would create a
     both-modes-set state without explicit clear flags.
@@ -779,6 +1187,56 @@ def _check_cadence_conflict_on_edit(
             "the switch from soft → hard cadence."
         )
 
+    # ---- NEGLECT-GAP axis vs DEADLINE axis (2026-08-21) -----------------
+    # Mirror of the two blocks above, on the gap axis. Three cases, and the
+    # ``clear_*`` opt-in is what distinguishes "the operator means to switch"
+    # from "the operator does not realise these are exclusive".
+    setting_gap = new_fields.get("escalate_after_gap_days") is not None
+    has_gap = existing_item.get("escalate_after_gap_days") is not None
+
+    if setting_gap and clear_escalate_after_gap_days:
+        # Contradictory intent in one call. The clear runs after the set, so
+        # proceeding would store nothing while reporting success — the exact
+        # silent-discard shape this commit exists to close. Refuse instead.
+        return (
+            "Cannot both set ``escalate_after_gap_days`` and pass "
+            "``clear_escalate_after_gap_days`` in the same edit — the clear "
+            "would discard the value you just supplied and the reply would "
+            "still say success. Send one or the other."
+        )
+
+    if setting_gap and setting_pattern:
+        return (
+            "Cannot set both ``escalate_after_gap_days`` (neglect-gap "
+            "escalation — days SINCE LAST COMPLETION) and ``due_pattern`` "
+            "(a hard deadline) in the same edit. They are mutually "
+            "exclusive: a completion gap is undefined under cycle-based "
+            "doneness. If you meant deadline escalation, the field is "
+            "``escalate_at_days`` (days BEFORE DUE)."
+        )
+
+    if setting_gap and has_pattern and not clear_due_pattern:
+        return (
+            "Item currently carries a hard deadline (``due_pattern``), so "
+            "``escalate_after_gap_days`` would be written and then ignored "
+            "by the tier engine (a completion gap is undefined under "
+            "cycle-based doneness). Pass ``--clear-due-pattern`` (CLI) or "
+            "``clear_due_pattern: true`` (talker) to drop the deadline and "
+            "move this item onto the neglect-gap axis. If instead you want "
+            "escalation RELATIVE TO THE DEADLINE, the field you want is "
+            "``escalate_at_days`` (days BEFORE DUE) — a different question."
+        )
+
+    if setting_pattern and has_gap and not clear_escalate_after_gap_days:
+        return (
+            "Item currently uses neglect-gap escalation "
+            "(``escalate_after_gap_days`` — days since last completion). "
+            "Setting ``due_pattern`` would leave that field inert on the "
+            "record. Pass ``--clear-escalate-after-gap-days`` (CLI) or "
+            "``clear_escalate_after_gap_days: true`` (talker) to confirm "
+            "the switch from the gap axis to the deadline axis."
+        )
+
     return None
 
 
@@ -798,6 +1256,8 @@ def cmd_item_add(
     target_cadence_days: Any = None,
     surface_at_days: Any = None,
     escalate_at_days: Any = None,
+    escalate_after_gap_days: Any = None,
+    warn_after_gap_days: Any = None,
     due_pattern: Any = None,
     self_care: Any = None,
 ) -> int:
@@ -833,6 +1293,8 @@ def cmd_item_add(
         target_cadence_days=target_cadence_days,
         surface_at_days=surface_at_days,
         escalate_at_days=escalate_at_days,
+        escalate_after_gap_days=escalate_after_gap_days,
+        warn_after_gap_days=warn_after_gap_days,
         due_pattern=due_pattern,
         self_care=self_care,
     )
@@ -893,15 +1355,16 @@ def cmd_item_add(
         # supplied fields.
         new_item: dict[str, Any] = {"text": item_text}
         new_item["priority"] = new_fields.get("priority", "tracked")
-        for k in (
-            "target_cadence_days",
-            "surface_at_days",
-            "escalate_at_days",
-            "due_pattern",
-            "self_care",
-        ):
-            if k in new_fields:
-                new_item[k] = new_fields[k]
+        # Copy every OTHER validated field through. This used to be a
+        # hardcoded name tuple, which is precisely how a field can be
+        # accepted by the validator and then dropped on the way to disk —
+        # the same silent-drop shape as the 2026-08-20 dispatcher defect,
+        # one layer down. ``new_fields`` contains only validated keys, so
+        # deriving from it makes the omission structurally impossible
+        # rather than merely currently-correct.
+        for k, v in new_fields.items():
+            if k != "priority":
+                new_item[k] = v
         items.append(new_item)
         return _MutationResult(
             items=items,
@@ -1060,16 +1523,21 @@ def cmd_item_edit(
     target_cadence_days: Any = None,
     surface_at_days: Any = None,
     escalate_at_days: Any = None,
+    escalate_after_gap_days: Any = None,
+    warn_after_gap_days: Any = None,
     due_pattern: Any = None,
     self_care: Any = None,
     clear_due_pattern: bool = False,
     clear_target_cadence_days: bool = False,
+    clear_escalate_after_gap_days: bool = False,
 ) -> int:
     """Edit one item's fields. Rename (``new_text``) migrates
     ``completion_log[old_text] → completion_log[new_text]`` atomically.
 
     All field kwargs default ``None`` (no change). ``clear_*`` flags
-    are the explicit opt-in for the cadence-mode switch (hard ↔ soft).
+    are the explicit opt-in for a mode switch: hard ↔ soft cadence
+    (``clear_due_pattern`` / ``clear_target_cadence_days``) and
+    deadline-axis ↔ neglect-gap-axis (``clear_escalate_after_gap_days``).
     """
     _check_salem_only(config)
     vault_path = Path(config.vault_path)
@@ -1095,6 +1563,8 @@ def cmd_item_edit(
         target_cadence_days=target_cadence_days,
         surface_at_days=surface_at_days,
         escalate_at_days=escalate_at_days,
+        escalate_after_gap_days=escalate_after_gap_days,
+        warn_after_gap_days=warn_after_gap_days,
         due_pattern=due_pattern,
         self_care=self_care,
     )
@@ -1155,6 +1625,7 @@ def cmd_item_edit(
             new_fields,
             clear_due_pattern=clear_due_pattern,
             clear_target_cadence_days=clear_target_cadence_days,
+            clear_escalate_after_gap_days=clear_escalate_after_gap_days,
         )
         if c_err is not None:
             # Refusal path: aborted so the primitive skips the write
@@ -1183,11 +1654,23 @@ def cmd_item_edit(
         # Also support clear-without-new-set (operator explicitly
         # wants to remove cadence entirely — falls back to the
         # gap-based annotation for tracked items).
+        #   3. clear_escalate_after_gap_days=True → drop the neglect-gap
+        #      threshold (the deadline-axis switch, or plain removal).
         if clear_due_pattern:
+            # NOTE the omission: ``escalate_after_gap_days`` is NOT stripped
+            # here. ``escalate_at_days`` / ``surface_at_days`` are DUE-axis
+            # knobs that are meaningless without a due_pattern, but the gap
+            # threshold is the opposite — it only WORKS once the deadline is
+            # gone. Stripping it would break the hard → gap switch (drop the
+            # deadline and set a gap threshold in one call), which is a
+            # supported path. Pinned by
+            # ``test_clear_due_pattern_preserves_escalate_after_gap_days``.
             for k in ("due_pattern", "escalate_at_days", "surface_at_days"):
                 existing.pop(k, None)
         if clear_target_cadence_days:
             existing.pop("target_cadence_days", None)
+        if clear_escalate_after_gap_days:
+            existing.pop("escalate_after_gap_days", None)
 
         # Handle text rename: update items[i].text AND migrate
         # completion_log key.
@@ -1215,6 +1698,9 @@ def cmd_item_edit(
                 ) + (
                     ["target_cadence_days (cleared)"]
                     if clear_target_cadence_days else []
+                ) + (
+                    ["escalate_after_gap_days (cleared)"]
+                    if clear_escalate_after_gap_days else []
                 ),
             },
         )
@@ -1449,4 +1935,13 @@ __all__ = [
     "cmd_item_remove",
     "cmd_item_edit",
     "cmd_undone",
+    # Accepted-field registry (2026-08-21) — consumed by the talker
+    # dispatcher in ``alfred.telegram.conversation`` for BOTH argv building
+    # and unsupported-field refusal. Exported so the two cannot drift.
+    "ITEM_FIELD_SPECS",
+    "ItemFieldSpec",
+    "accepted_item_fields",
+    "describe_unsupported_field",
+    "unsupported_fields_message",
+    "unsupported_item_fields",
 ]
