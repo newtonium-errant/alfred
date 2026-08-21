@@ -14,7 +14,48 @@ The executor:
    narrow tool surface (``vault_read``, ``vault_edit``, ``vault_create``,
    ``vault_move``, ``vault_list``, ``vault_search``, ``vault_context``).
    Each tool call is gated through ``check_scope("instructor", ...)``
-   so even a jailbreak attempt can't request a denied op.
+   in ``_execute_tool`` before dispatch, so even a jailbreak attempt
+   can't request a denied OP (``delete`` is refused there — driven).
+
+   SCOPE OF THAT GATE — it is an OP-LEVEL gate only. The pre-dispatch
+   call is the ONLY ``check_scope`` on this path: ``ops.vault_edit`` /
+   ``vault_create`` / ``vault_move`` are called WITHOUT ``scope=``, and
+   every in-``ops`` scope check sits behind ``if scope is not None``, so
+   none of them run. Three enforcement legs are therefore inactive here
+   that ARE active on the talker (``conversation.py``, ``scope=
+   active_scope``) and batch (``worker.py``, ``scope=BATCH_SCOPE``)
+   paths — the instructor is the only one of the three that omits it:
+
+     * per-TYPE rules — the pre-dispatch call passes
+       ``record_type=tool_input.get("type", "")`` and the ``vault_edit``
+       schema has no ``type`` property, so record_type is ALWAYS ``""``
+       for an edit. ``ops.vault_edit`` reads the real type off disk.
+     * the body-mutation matrix — ``_BODY_MUTATE_DENIED_TYPES`` plus the
+       ``allow_body_insert_at`` / ``allow_body_replace`` allowlists are
+       reached only via ``check_scope(scope, "body_insert_at"/
+       "body_replace", ...)`` inside ``vault_edit``. Not run here.
+     * body-write accounting — the pre-dispatch ``body_write`` flag is
+       ``bool(body) or bool(body_append)``, so a ``body_replace`` or
+       ``body_insert_at`` edit is seen as body_write=False, and
+       ``append_fields`` keys are invisible to the ``fields`` list.
+
+   What DOES still constrain body mutations here is the UNCONDITIONAL
+   part of ``vault_edit``: the mutual-exclusion gate (at most one body
+   kwarg per call) and the no-op gate both run before any scope check
+   and so apply to this path — see ``tests/test_vault_edit_body_
+   mutation.py``. That is a shape gate, not a policy gate: it constrains
+   HOW MANY body surfaces one call may use, never WHICH RECORD may be
+   rewritten. Threading ``scope="instructor"`` is proposed but NOT
+   ratified; see ``tests/test_instructor_scope_truth.py`` for the pinned
+   enumeration of what it would change.
+
+   Note when weighing that proposal: ``body_replace`` and
+   ``body_insert_at`` are the two surfaces the deny set would refuse,
+   and while ``vault-instructor/SKILL.md`` does not list them, the
+   ``vault_edit`` TOOL DESCRIPTION below DOES ("body_replace (full
+   rewrite)"). The model reads that description, so those surfaces are
+   advertised and genuinely reachable — the SKILL's silence is not a
+   reason to treat them as unused.
 
 3. On success, appends a single-line audit comment to the record body
    (``<!-- ALFRED:INSTRUCTION ... -->``) and prunes older blocks beyond
@@ -25,9 +66,38 @@ The executor:
    queue entry is dropped and the error surfaces to a visible
    ``alfred_instructions_error`` frontmatter field.
 
-Every vault mutation is logged via ``mutation_log.log_mutation`` with
-``scope="instructor"`` so the audit log can distinguish instructor
-activity from talker / curator / janitor.
+Mutation logging — READ THIS BEFORE TRUSTING THE AUDIT TRAIL.
+
+``_execute_tool`` calls ``mutation_log.log_mutation(session_path, ...,
+scope="instructor")`` after every create / edit / move. Those calls are
+INERT ON THE PRODUCTION PATH: ``log_mutation`` returns immediately when
+``session_path`` is falsy, ``session_path`` defaults to ``None`` on both
+``execute`` and ``execute_and_record``, and the daemon's only call site
+(``daemon.py``, the sole caller in ``src/``) does not pass it. So a
+daemon-executed directive writes NO mutation-log row at all — instructor
+vault mutations are absent from the trail rather than mislabelled in it.
+Tests that pass ``session_path`` explicitly DO produce rows, which is why
+this reads as working when driven directly.
+
+Two further limits on what a row would mean if one were written:
+
+  * ``scope="instructor"`` rides in ``**extra`` into the SESSION JSONL.
+    It is PROVENANCE (which subsystem acted), not proof that the scope
+    matrix was enforced — and note the op-level gate genuinely does run
+    (see above), so the label is not a false claim about a gate that
+    never fired; it is simply narrower than "the instructor scope was
+    applied to this write".
+  * ``data/vault_audit.log`` never carries the scope at all.
+    ``append_to_audit_log`` writes ``{ts, tool, op, path, detail}`` — no
+    scope field exists in that row shape. An operator asking "what was
+    allowed to write this record?" cannot answer it from the audit log
+    for ANY tool, and for the instructor there is no row to read.
+
+Wiring ``session_path`` through is a live gap, not a design choice; it
+needs a session-file lifecycle (create → flush via ``read_mutations`` →
+``append_to_audit_log`` → cleanup) that no instructor caller owns yet.
+Pinned in ``tests/test_instructor_scope_truth.py`` so the day someone
+threads it, the pin turns red and this paragraph gets rewritten.
 """
 
 from __future__ import annotations
@@ -312,9 +382,21 @@ def _dispatch_tool(
     fields_list = list(set_fields.keys()) if set_fields else None
     body_write = bool(body) or bool(body_append)
 
-    # ---- Scope gate (belt-and-braces; scope says instructor has broad
-    # access but we still gate on each op so a future scope tightening
-    # can't silently grant something the SKILL is relying on) ----------
+    # ---- Scope gate — OP-LEVEL, and the ONLY check_scope on this path.
+    # Instructor has broad access, but gating each op means a future
+    # scope tightening can't silently grant something the SKILL relies
+    # on. This DOES fire (``delete`` denies here).
+    #
+    # What it does NOT reach, because ``ops.vault_*`` below are called
+    # without ``scope=`` and every in-ops check sits behind ``if scope is
+    # not None``: the per-type rules (``record_type`` is always "" for an
+    # edit — the vault_edit schema has no ``type`` property), the
+    # body-mutation matrix (``_BODY_MUTATE_DENIED_TYPES`` +
+    # allow_body_* allowlists), and accurate body-write accounting
+    # (``body_write`` below ignores body_replace / body_insert_at, and
+    # ``fields`` ignores append_fields keys). Full reasoning + the
+    # measured enumeration: module docstring and
+    # ``tests/test_instructor_scope_truth.py``. -----------------------
     try:
         scope.check_scope(
             "instructor",

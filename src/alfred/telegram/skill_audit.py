@@ -243,10 +243,22 @@ def audit_skill(raw: dict[str, Any]) -> AuditResult:
             ``telegram.tool_set`` / ``gcal.enabled`` paths are read).
 
     Returns:
-        :class:`AuditResult` summarising the gap. Always returns a
-        result — never raises on operator-input issues (missing
-        sections, malformed config). Genuine programmer errors
-        (e.g., ``conversation`` module missing entirely) propagate.
+        :class:`AuditResult` summarising the gap. Returns a result for
+        every operator-input issue it HANDLES (missing sections, an
+        instance block that is absent / falsy / a dict without ``name``).
+        Genuine programmer errors (e.g., ``conversation`` module missing
+        entirely) propagate.
+
+        ONE KNOWN OPERATOR-INPUT SHAPE STILL RAISES (measured
+        2026-08-21): a TRUTHY non-dict ``telegram.instance`` — e.g. the
+        plausible YAML slip ``instance: Salem`` instead of
+        ``instance: {name: Salem}``. That LOADS without a TypeError, so
+        the discriminator below never sees it, and ``config.instance.name``
+        raises AttributeError. Both callers wrap this call in
+        ``except Exception`` and the health probe renders a non-quiet
+        WARN, so it fails OPEN rather than silently — but this function's
+        "never raises" contract does not hold for that shape. Pinned in
+        ``tests/test_instructor_scope_truth.py``.
 
     Special cases:
         * ``telegram`` section absent or ``instance.name`` missing →
@@ -314,10 +326,36 @@ def audit_skill(raw: dict[str, Any]) -> AuditResult:
         # instance not-a-dict). The ``name``-KEY test is the exact
         # trigger: an empty, None, or non-str name LOADS successfully
         # and falls through to the ``"(unnamed)"`` path below, so none of
-        # those may be treated as absent. A non-dict ``instance`` block
-        # is malformed rather than "incomplete", so it takes the LOUD
-        # branch — unknown shapes fail OPEN into a card, matching the
-        # health-status denylist direction in ``CLAUDE.md``.
+        # those may be treated as absent.
+        #
+        # NON-DICT ``instance`` BLOCKS — three classes, all DRIVEN
+        # through ``audit_skill`` on 2026-08-21 (an earlier version of
+        # this comment claimed they "take the LOUD branch"; that is true
+        # of NEITHER class, and re-running the predicate inline rather
+        # than driving the entry point is what hid it):
+        #
+        #   * FALSY non-dict (None / "" / [] / 0 / False) — coerced to
+        #     ``{}`` by the ``or {}`` below, so it reaches HERE and takes
+        #     the SKIP branch. Correct: ``load_from_unified`` coerces the
+        #     same shapes identically, so they are indistinguishable from
+        #     an absent block. 6 shapes measured.
+        #   * TRUTHY non-dict ('a string' / [1,2] / 5 / 3.5 / True) —
+        #     never reaches this branch AT ALL. ``_build`` assigns the raw
+        #     value straight through, so ``load_talker_config`` SUCCEEDS,
+        #     no TypeError is raised, and ``audit_skill`` then raises
+        #     AttributeError on ``config.instance.name`` below. 5 shapes
+        #     measured.
+        #   * dict without ``name`` — the documented case, SKIP below.
+        #
+        # The truthy class still fails OPEN, just not here: both callers
+        # (``health.py::_check_skill_capability_audit``, ``cli.py``
+        # skill-audit) wrap this in ``except Exception``, and the health
+        # probe converts it to a NON-QUIET WARN naming the AttributeError.
+        # So severity matches the denylist direction in ``CLAUDE.md``
+        # even though the mechanism is the caller's catch, not this
+        # discriminator. Pinned both ways in
+        # ``tests/test_instructor_scope_truth.py`` — including the WARN,
+        # so that if anyone "fixes" the raise they must keep it loud.
         telegram_raw = raw.get("telegram")
         instance_raw = (
             telegram_raw.get("instance") if isinstance(telegram_raw, dict) else None
