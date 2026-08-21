@@ -1149,6 +1149,35 @@ def _parse_item_completion_dates(raw: Any) -> list[date]:
     return out
 
 
+def _cadence_metadata(
+    completion_dates: list[date], *, target: int, today: date,
+) -> tuple[int | None, float]:
+    """``(days_since_last_completed, overdue_ratio)`` for a soft-cadence item.
+
+    ONE owner for the pair, lifted here the moment a SECOND consumer appeared
+    (``_hydrate_curated_entries``' routine branch) rather than after the two
+    spellings had a chance to disagree. The auto-T3 surface and the hydrated
+    curated copy of the SAME item must produce the same two numbers, or the
+    brief annotates an accepted item differently from the card that was
+    accepted.
+
+    Never-completed is ``(None, inf)`` — max overdue, and the render's "never
+    done" wording (``T3_AUTO_DAYS_SINCE_NEVER_LABEL``) is TRUE for exactly that
+    shape and false for every other. A future-dated completion (operator
+    hand-edit) clamps to 0, matching ``classify_routine_item``'s own clamp so
+    the ratio and the surface predicate agree.
+
+    ``target`` is required to be a positive int by both callers (the classifier
+    rejects zero/negative before either reaches here).
+    """
+    if not completion_dates:
+        return None, float("inf")
+    days_since = (today - max(completion_dates)).days
+    if days_since < 0:
+        days_since = 0
+    return days_since, days_since / target
+
+
 # ---------------------------------------------------------------------------
 # Phase 2A-soft-cadence — auto-T3 surface for routine items with
 # ``target_cadence_days`` (2026-05-30)
@@ -1408,24 +1437,17 @@ def compute_auto_t3_candidates(
             target = item.target_cadence_days
             assert isinstance(target, int) and target > 0
 
-            completion_dates = _parse_item_completion_dates(
-                completion_log.get(item.text, [])
+            # Sort metadata from the ONE owner (``_cadence_metadata``) — the
+            # hydrator computes the same pair for the curated copy of this
+            # item, and two spellings of "days since / overdue ratio" would
+            # drift silently.
+            days_since_value, ratio = _cadence_metadata(
+                _parse_item_completion_dates(
+                    completion_log.get(item.text, [])
+                ),
+                target=target,
+                today=today_local,
             )
-            days_since_value: int | None
-            if completion_dates:
-                most_recent = max(completion_dates)
-                days_since = (today_local - most_recent).days
-                # Future-dated completion (operator hand-edit) → clamp.
-                # (The classifier already clamps for its predicate; we
-                # clamp here too so the ratio matches.)
-                if days_since < 0:
-                    days_since = 0
-                days_since_value = days_since
-                ratio = days_since / target
-            else:
-                # Never completed — treat as max overdue.
-                days_since_value = None
-                ratio = float("inf")
 
             candidates.append(AutoT3Candidate(
                 path=rel_path,
@@ -2374,25 +2396,35 @@ def compute_today_view(
     # every operator-curated row, and rule 1 ("the operator's word is final") is
     # DEAD for them.
     #
-    # ``_curated_to_tier_entry`` builds from a ``daily_curation`` entry, which
-    # carries only the item's identity (a wikilink, or a record+text pair) — it
-    # has no due date, no ``slot:``, no ``self_care``, no ``due_pattern``,
+    # ``_curated_to_tier_entry`` / ``_curated_t3_to_tier_entry`` build from a
+    # ``daily_curation`` entry, which carries only the item's identity (a
+    # wikilink, a record+text pair, or — in the T3 lane — a bare string) — no
+    # due date, no ``slot:``, no ``self_care``, no ``due_pattern``, no cadence,
     # because those live on the BACKING RECORD and the curation block never
-    # copied them. Every auto lane reads them off the record; the curated
-    # converter was the one construction site that did not, so a curated entry
-    # arrived here with all four classifier inputs empty and classified
+    # copied them. Every auto lane reads them off the record; the three curated
+    # converters are the construction sites that do not, so a curated entry
+    # arrives here with its classifier inputs empty and classifies
     # ``unslotted / no_signal`` no matter what its record said.
     #
-    # MEASURED, 2026-08-19: a task with ``due: 2026-08-21`` AND ``slot: duty``
-    # written on it, curated into T2, reported ``slot='unslotted',
-    # slot_rule='no_signal'``. That is the operator's screenshot — four dated
-    # tasks under "NOT SORTED YET" — and it is also why writing a slot from the
-    # board would have appeared to do nothing.
+    # MEASURED, 2026-08-19 (task side): a task with ``due: 2026-08-21`` AND
+    # ``slot: duty`` written on it, curated into T2, reported
+    # ``slot='unslotted', slot_rule='no_signal'``. That is the operator's
+    # screenshot — four dated tasks under "NOT SORTED YET" — and it is also why
+    # writing a slot from the board would have appeared to do nothing.
+    #
+    # MEASURED, 2026-08-21 (routine side, the other half of the same bug):
+    # ``Hot Tub Chemistry`` carries ``slot: rhythm`` AND
+    # ``target_cadence_days: 1`` on ``routine/Core Daily.md``. Accepted into
+    # today's board it reported ``unslotted / no_signal`` and landed in no ring
+    # at all, while the SAME item un-accepted classified ``rhythm / explicit``.
+    # Accepting a card was silently costing it its ring.
     #
     # Hydration is CONSERVATIVE: it fills only fields the curated entry left
     # empty, so a value the converter did set still wins, and it is a pure read
-    # of the record. It cannot change any already-slotted row.
-    _hydrate_curated_entries(vault_path, (t1, t2, t3))
+    # of the record. It cannot change any already-slotted row. ``today`` is
+    # threaded for the cadence pair (days-since is a fact about TODAY, and the
+    # brief's cadence annotation is false without it).
+    _hydrate_curated_entries(vault_path, (t1, t2, t3), today=today)
 
     _slot_verdicts: list[slots.SlotVerdict] = []
     for _lane in (t1, t2, t3):
@@ -2436,7 +2468,146 @@ def compute_today_view(
     )
 
 
-def _hydrate_curated_entries(vault_path: Path, lanes) -> None:
+@dataclass(frozen=True)
+class _RoutineItemFacts:
+    """What one routine ITEM says about itself — the hydration payload.
+
+    Everything here is read off the item's own entry in its record's ``items``
+    list (plus that record's ``completion_log`` for the cadence pair). Nothing
+    is inherited from the RECORD and nothing is guessed from a sibling item;
+    see :func:`_hydrate_curated_entries` on why that distinction is the whole
+    argument for hydrating ``target_cadence_days`` here when the task path
+    deliberately does not.
+    """
+
+    record_name: str
+    explicit_slot: str | None
+    self_care: bool
+    has_due_pattern: bool
+    target_cadence_days: int | None
+    days_since_last_completed: int | None
+    overdue_ratio: float | None
+
+
+@dataclass(frozen=True)
+class _RoutineItemIndex:
+    """Routine items, keyed for the two curated shapes that need them.
+
+    * ``by_record_and_text`` — the ANCHORED shape (a curated T1/T2 entry names
+      ``routine_item: {record, text}``). Registered under the record's ``name``
+      AND its filename stem, because the curated block carries whichever of the
+      two the writer had in hand.
+    * ``by_text`` — the FREE-TEXT shape (a curated T3 entry carries only
+      ``item:``; :class:`alfred.tier.daily_curation.T3Entry` has no record
+      field at all, so the anchor is gone by the time it is re-read). A list,
+      not a single value: two records may legitimately carry an item of the
+      same text, and that ambiguity is refused rather than resolved by a coin
+      flip.
+
+    ``records_scanned`` is reported on the miss signals so "found nothing" and
+    "there was nothing to find" stay distinguishable.
+    """
+
+    by_record_and_text: dict[tuple[str, str], _RoutineItemFacts]
+    by_text: dict[str, list[_RoutineItemFacts]]
+    records_scanned: int
+
+
+def _norm_key(raw: Any) -> str:
+    """The identity spelling used for record names and item texts here.
+
+    ``strip().lower()`` — the same normalisation ``_routine_key`` applies for
+    lane dedup, plus a strip (``Item.from_dict`` and the confirm writer both
+    strip, so a stored text and a parsed one can differ only in whitespace the
+    operator hand-typed).
+    """
+    return str(raw or "").strip().lower()
+
+
+def _build_routine_item_index(vault_path: Path, today: date) -> _RoutineItemIndex:
+    """Read every routine record ONCE and index its items for hydration.
+
+    The record-level filters are the SAME ones every auto surface applies —
+    ``type: routine``, not ``status: archived``, not ``alfred_triage: true``.
+    That is deliberate rather than defensive copying: hydration must see the
+    vault the projection sees, so an archived record cannot silently supply a
+    slot for a row no auto lane would ever have surfaced.
+    """
+    import frontmatter  # type: ignore[import-untyped]
+
+    from alfred.routine.config import Item
+
+    by_record_and_text: dict[tuple[str, str], _RoutineItemFacts] = {}
+    by_text: dict[str, list[_RoutineItemFacts]] = {}
+    scanned = 0
+
+    routine_dir = vault_path / "routine"
+    if not routine_dir.is_dir():
+        return _RoutineItemIndex({}, {}, 0)
+
+    for record_path in sorted(routine_dir.glob("*.md")):
+        try:
+            post = frontmatter.load(str(record_path))
+        except Exception:  # noqa: BLE001 — a hint is never worth the board
+            continue
+        fm = dict(post.metadata or {})
+        if fm.get("type") != "routine":
+            continue
+        if str(fm.get("status") or "active").lower() == "archived":
+            continue
+        if fm.get("alfred_triage") is True:
+            continue
+        raw_items = fm.get("items") or []
+        if not isinstance(raw_items, list):
+            continue
+        scanned += 1
+
+        record_name = str(fm.get("name") or record_path.stem)
+        completion_log = fm.get("completion_log") or {}
+        if not isinstance(completion_log, dict):
+            completion_log = {}
+
+        for raw_item in raw_items:
+            item = Item.from_dict(raw_item)
+            if item is None:
+                continue
+            target = item.target_cadence_days
+            if isinstance(target, int) and target > 0:
+                days_since, ratio = _cadence_metadata(
+                    _parse_item_completion_dates(
+                        completion_log.get(item.text, [])
+                    ),
+                    target=target,
+                    today=today,
+                )
+            else:
+                # Not a soft-cadence item (or a zero/negative target, which
+                # the classifier refuses too) — no cadence pair to carry.
+                target, days_since, ratio = None, None, None
+
+            facts = _RoutineItemFacts(
+                record_name=record_name,
+                explicit_slot=item.slot,
+                self_care=item.self_care,
+                has_due_pattern=item.due_pattern is not None,
+                target_cadence_days=target,
+                days_since_last_completed=days_since,
+                overdue_ratio=ratio,
+            )
+            text_key = _norm_key(item.text)
+            # Register under BOTH spellings of the record's identity; the
+            # curated block may name either (the confirm writer stores the
+            # record NAME, a hand-edit may use the filename).
+            for record_key in {
+                _norm_key(record_name), _norm_key(record_path.stem),
+            }:
+                by_record_and_text.setdefault((record_key, text_key), facts)
+            by_text.setdefault(text_key, []).append(facts)
+
+    return _RoutineItemIndex(by_record_and_text, by_text, scanned)
+
+
+def _hydrate_curated_entries(vault_path: Path, lanes, *, today: date) -> None:
     """Fill a curated entry's missing classifier inputs from its backing record.
 
     In place, and only where the entry is EMPTY — an auto-built entry already
@@ -2444,24 +2615,69 @@ def _hydrate_curated_entries(vault_path: Path, lanes) -> None:
     keeps it. Reading, never writing: the slot axis is a producer-time overlay
     and this is part of computing it.
 
-    Which fields, and why exactly these four: they are the inputs
-    :func:`alfred.tier.slots.classify_slot` reads — ``explicit_slot`` (rule 1),
-    ``self_care`` (rule 3), ``has_due_pattern`` (rule 4) and ``due_iso``
-    (rule 6). ``target_cadence_days`` (rule 5) is deliberately NOT hydrated
-    here: it is a per-ITEM routine field rather than a record-level one, and
+    **Two branches, because the two curated shapes lose different things.**
+
+    *Task origin* — the entry names a ``task/`` record, so the fields are read
+    from that record's frontmatter: ``explicit_slot`` (rule 1), ``self_care``
+    (rule 3), ``has_due_pattern`` (rule 4) and ``due_iso`` (rule 6).
+    ``target_cadence_days`` (rule 5) is deliberately NOT hydrated on this
+    branch: it is a per-ITEM routine field rather than a record-level one, and
     guessing it from the record would place a habit anchor in Rhythm on the
     strength of a sibling item's cadence.
 
-    Task-origin entries only. A curated ROUTINE-origin entry names a record and
-    an item text, and the per-item fields would have to be located inside the
-    record's ``items`` list — a different read with a different failure mode
-    (a renamed item silently hydrating from nothing). That is worth doing and
-    is deliberately not smuggled in here; the entry keeps its current behaviour.
+    *Routine origin* (2026-08-21) — the fields live on the item's own entry
+    inside the record's ``items`` list, so this branch reads THE ITEM. It
+    hydrates ``target_cadence_days``, and the objection quoted above does NOT
+    transfer: that objection is about provenance — reading a RECORD-level value
+    and attributing it to one item. Reading the item's own entry gives that
+    item's cadence and no sibling's; when the matched item carries no cadence
+    the field stays ``None`` and rule 5 does not fire, which is an absence, not
+    a guess. The decisive argument is agreement: the auto-T3 lane already puts
+    ``target_cadence_days`` on the TierEntry for this very item, so hydrating
+    it makes the ACCEPTED copy classify the same as the card that was accepted.
+    Accept must be slot-preserving; before this it was not (measured
+    2026-08-21: ``Hot Tub Chemistry``, ``slot: rhythm`` +
+    ``target_cadence_days: 1`` on the record, accepted into T3, reported
+    ``unslotted / no_signal`` — landing in no ring at all).
 
-    Failure is silent BY DESIGN: an unreadable or absent record leaves the entry
-    exactly as it was, which is the pre-existing behaviour. A projection that
-    raised because one task file was mid-write would take the whole morning
-    board down over a field that is, at worst, a missing hint.
+    ``days_since_last_completed`` (and ``overdue_ratio``) ride along with the
+    cadence value and are NOT optional extras: the brief renders a cadence row
+    with no days-since as *"never done; target every Nd"*
+    (``T3_AUTO_DAYS_SINCE_NEVER_LABEL``). Hydrating the target alone would put
+    a confident false claim on the operator's morning for any item completed
+    recently. The two travel together or the render lies.
+
+    ``due_iso`` is NOT hydrated on the routine branch: rule 6 is task-origin
+    only, so it is not a classifier input here, and a curated T1 routine row
+    already receives the auto candidate's due via ``auto_due_by_t1_key``.
+
+    **Identity is never hydrated.** A free-text T3 row whose text resolves to a
+    routine item keeps ``routine_record=None``. Stamping the resolved record on
+    it would move the row's dedup key AND move its done-state home from the
+    entry's own ``done_at`` to that record's ``completion_log`` (see
+    :class:`alfred.tier.daily_curation.T3Entry` — ``done_at`` is the ONLY
+    done-state home for a free-text item). This function fills classifier
+    inputs; it does not re-anchor rows.
+
+    **The named failure mode, answered.** A renamed item resolves to nothing
+    and the row stays unslotted — indistinguishable, from the outside, from a
+    record that genuinely says nothing. Every unresolved routine-origin row
+    therefore emits a signal, and the reasons are distinct because the causes
+    are: ``unknown_record`` / ``no_such_item`` / ``ambiguous_text`` are WARNs
+    (an entry that NAMES a record and misses it is anomalous; an ambiguous text
+    is a refusal to guess), while a free-text row matching no routine item is
+    the ORDINARY case for that lane — "Read for an hour" is a genuine ad-hoc
+    intention, not a rename — and gets its own INFO event so it can never be
+    read as the anomaly. One ``tier.hydrate.routine_summary`` per projection
+    reports the rollup, including zero (intentionally-left-blank; the same
+    unconditional-emission contract ``slots.log_coverage`` keeps one caller up).
+
+    Failure is silent BY DESIGN for the RECORD read: an unreadable or absent
+    record leaves the entry exactly as it was, which is the pre-existing
+    behaviour. A projection that raised because one task file was mid-write
+    would take the whole morning board down over a field that is, at worst, a
+    missing hint. (Silent means "does not raise" — the unresolved row still
+    announces itself per the paragraph above.)
     """
     import frontmatter  # type: ignore[import-untyped]
 
@@ -2479,35 +2695,194 @@ def _hydrate_curated_entries(vault_path: Path, lanes) -> None:
                 pass
         return cache[rel_path]
 
+    index: _RoutineItemIndex | None = None
+    considered = hydrated = unmatched = ambiguous = 0
+
     for lane in lanes:
         for entry in lane:
-            if entry.origin != "task":
+            if entry.origin == "task":
+                # Only CURATED entries reach here empty on all four; an auto
+                # entry populated them at construction. Testing the fields
+                # rather than the source string keeps this correct if a new
+                # curated source appears.
+                needs = (
+                    entry.explicit_slot is None
+                    or not entry.due_iso
+                    or not entry.self_care
+                    or not entry.has_due_pattern
+                )
+                if not needs:
+                    continue
+                rel = (entry.path or "").strip()
+                if not rel:
+                    continue
+                fm = _fm_for(rel)
+                if not fm:
+                    continue
+                if entry.explicit_slot is None and fm.get("slot") is not None:
+                    entry.explicit_slot = str(fm["slot"]).strip()
+                if not entry.due_iso and fm.get("due"):
+                    entry.due_iso = str(fm["due"]).strip()
+                if not entry.self_care:
+                    entry.self_care = _coerce_self_care(
+                        fm.get("self_care", False)
+                    )
+                if not entry.has_due_pattern and fm.get("due_pattern"):
+                    entry.has_due_pattern = True
                 continue
-            # Only CURATED entries reach here empty on all four; an auto entry
-            # populated them at construction. Testing the fields rather than the
-            # source string keeps this correct if a new curated source appears.
-            needs = (
+
+            if entry.origin != "routine_item":
+                continue
+
+            text = (entry.item_text or entry.name or "").strip()
+            if not text:
+                continue
+            # ALL FOUR empty — the blind-construction signature, and an AND
+            # rather than the task branch's OR on purpose. On the routine side
+            # the OR is vacuous: ``not self_care`` and ``not has_due_pattern``
+            # are true of most perfectly-hydrated auto rows, so an OR would
+            # re-read the whole routine directory on every projection and count
+            # rows that needed nothing. A row carrying ANY classifier input was
+            # built by a lane that read the item; only the curated converters
+            # produce one with none. (Testing the FIELDS, not the source string,
+            # so a new curated source is covered the day it appears.)
+            blind = (
                 entry.explicit_slot is None
-                or not entry.due_iso
-                or not entry.self_care
-                or not entry.has_due_pattern
+                and not entry.self_care
+                and not entry.has_due_pattern
+                and entry.target_cadence_days is None
             )
-            if not needs:
+            if not blind:
                 continue
-            rel = (entry.path or "").strip()
-            if not rel:
+            considered += 1
+
+            if index is None:
+                index = _build_routine_item_index(vault_path, today)
+
+            record = (entry.routine_record or "").strip()
+            text_key = _norm_key(text)
+            facts: _RoutineItemFacts | None = None
+            reason: str | None = None
+            candidates: list[str] = []
+
+            if record:
+                facts = index.by_record_and_text.get((_norm_key(record), text_key))
+                if facts is None:
+                    # WHY it missed, because the two causes call for different
+                    # operator actions: a record nobody can find vs. an item
+                    # text that no longer matches anything inside a record that
+                    # IS there (the rename).
+                    reason = (
+                        "no_such_item"
+                        if any(
+                            key[0] == _norm_key(record)
+                            for key in index.by_record_and_text
+                        )
+                        else "unknown_record"
+                    )
+            else:
+                matches = index.by_text.get(text_key, [])
+                # Distinct RECORDS, not distinct entries: one record listing
+                # the same text twice is a malformed record, not a genuine
+                # ambiguity about whose cadence applies.
+                by_record = {m.record_name: m for m in matches}
+                if len(by_record) == 1:
+                    facts = next(iter(by_record.values()))
+                elif len(by_record) > 1:
+                    reason = "ambiguous_text"
+                    candidates = sorted(by_record)
+                else:
+                    reason = "no_routine_match"
+
+            if facts is None:
+                if reason == "ambiguous_text":
+                    ambiguous += 1
+                else:
+                    unmatched += 1
+                _log_unresolved_routine_entry(
+                    entry, reason=reason or "no_routine_match",
+                    text=text, candidates=candidates,
+                    records_scanned=index.records_scanned,
+                )
                 continue
-            fm = _fm_for(rel)
-            if not fm:
-                continue
-            if entry.explicit_slot is None and fm.get("slot") is not None:
-                entry.explicit_slot = str(fm["slot"]).strip()
-            if not entry.due_iso and fm.get("due"):
-                entry.due_iso = str(fm["due"]).strip()
+
+            if entry.explicit_slot is None and facts.explicit_slot is not None:
+                entry.explicit_slot = facts.explicit_slot
             if not entry.self_care:
-                entry.self_care = _coerce_self_care(fm.get("self_care", False))
-            if not entry.has_due_pattern and fm.get("due_pattern"):
-                entry.has_due_pattern = True
+                entry.self_care = facts.self_care
+            if not entry.has_due_pattern:
+                entry.has_due_pattern = facts.has_due_pattern
+            if entry.target_cadence_days is None:
+                entry.target_cadence_days = facts.target_cadence_days
+                # Paired — see the docstring. Never one without the other.
+                if entry.days_since_last_completed is None:
+                    entry.days_since_last_completed = (
+                        facts.days_since_last_completed
+                    )
+                if entry.overdue_ratio is None:
+                    entry.overdue_ratio = facts.overdue_ratio
+            hydrated += 1
+
+    # ILB: emitted every projection, including the all-zero one. "The hydrator
+    # found nothing to do" and "the hydrator stopped running" are the same
+    # picture without this line, and the rename signal below it is only
+    # trustworthy if its absence means something.
+    log.info(
+        "tier.hydrate.routine_summary",
+        considered=considered,
+        hydrated=hydrated,
+        unmatched=unmatched,
+        ambiguous=ambiguous,
+        records_scanned=(index.records_scanned if index is not None else 0),
+    )
+
+
+def _log_unresolved_routine_entry(
+    entry: TierEntry, *, reason: str, text: str,
+    candidates: list[str], records_scanned: int,
+) -> None:
+    """Announce a curated routine row that hydrated from nothing.
+
+    Level is chosen by what the miss MEANS, not by convenience. An entry that
+    names a record (``unknown_record`` / ``no_such_item``) or a text that two
+    records both claim (``ambiguous_text``) is anomalous — WARN. A free-text T3
+    row matching no routine item is the ordinary shape of that lane and gets an
+    INFO under its OWN event name, so a WARN grep for renames is never diluted
+    by every ad-hoc intention the operator types.
+    """
+    fields = dict(
+        reason=reason,
+        # ILB data shape: always present, empty for the free-text shape, so a
+        # consumer can never mistake "no record named" for "field not emitted".
+        record=(entry.routine_record or ""),
+        item_text=text,
+        tier=entry.tier,
+        source=entry.source,
+        records_scanned=records_scanned,
+        candidates=candidates,
+    )
+    if reason == "no_routine_match":
+        log.info(
+            "tier.hydrate.free_text_no_routine_match",
+            hint=(
+                "free-text row matches no routine item — expected for an "
+                "ad-hoc intention; it stays unslotted because there is "
+                "genuinely nothing to read."
+            ),
+            **fields,
+        )
+        return
+    log.warning(
+        "tier.hydrate.routine_item_unresolved",
+        hint=(
+            "curated routine row could not be resolved to an item, so its "
+            "slot inputs are unreadable and it will render unslotted. A "
+            "renamed item or a renamed record is the usual cause; "
+            "ambiguous_text means two records claim this text and the "
+            "classifier refuses to guess which cadence applies."
+        ),
+        **fields,
+    )
 
 
 def _entry_key(entry: TierEntry, task_key, routine_key) -> str:
