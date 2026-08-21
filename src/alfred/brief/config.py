@@ -311,6 +311,22 @@ class BriefConfig:
     # means the block was never loaded, which renders no section at all.
     drip: Any = None
 
+    # The MOC suggestion queue this instance's surveyor enqueues into, resolved
+    # ONCE at load time from the ``surveyor:`` block (see
+    # ``surveyor.config.resolve_moc_queue_path``). Empty string = this config
+    # has no ``surveyor:`` block, so no queue exists to read.
+    #
+    # A DECLARED FIELD, and that is the whole fix rather than a detail of it.
+    # The reader used to reach for ``getattr(config, "surveyor", None)`` on
+    # this dataclass — which never had a ``surveyor`` field, so the lookup
+    # could not raise, quietly returned ``None``, and the MOC reader
+    # short-circuited on EVERY config on EVERY instance from the day it
+    # shipped. Reading a declared field instead means a future rename fails
+    # loudly at the call site rather than degrading into a permanent, plausible
+    # "not configured here". Mirrors ``tier_defaults.snooze_path``, which is
+    # resolved in the same loader for the same read/write-must-agree reason.
+    moc_queue_path: str = ""
+
 
 def _load_drip_config(raw: dict[str, Any]) -> Any:
     """Build the drip config, or ``None`` if drip isn't importable.
@@ -354,6 +370,10 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
     # cannot resolve to different files.
     from alfred.tier.snooze import resolve_snooze_path
     tier_defaults.snooze_path = resolve_snooze_path(raw) or ""
+    # Lazy for the same reason as the two imports above: keeps the
+    # brief→surveyor dependency at call time rather than module load, so the
+    # brief stays importable on an instance without the surveyor's extras.
+    from alfred.surveyor.config import resolve_moc_queue_path
     log_dir = raw.get("logging", {}).get("dir", "./data")
 
     # Parse stations
@@ -584,6 +604,12 @@ def load_from_unified(raw: dict[str, Any]) -> BriefConfig:
         # surface rather than two parsers that can disagree. Absent block ⇒ no
         # campaigns ⇒ the Campaigns section never renders (deploy-inert).
         drip=_load_drip_config(raw),
+        # THE read-side resolution point for the MOC queue, exactly once, from
+        # the surveyor's own helper — the same call the act router's loader
+        # makes, so the side that DEALS the card and the side that FLIPS its
+        # ledger row cannot land on different files. Same shape as
+        # ``tier_defaults.snooze_path`` above.
+        moc_queue_path=str(resolve_moc_queue_path(raw) or ""),
         instance_name=(
             ((raw.get("telegram") or {}).get("instance") or {}).get("name", "") or ""
         ).strip().lower(),

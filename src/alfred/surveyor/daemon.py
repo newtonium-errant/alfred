@@ -1380,16 +1380,20 @@ class Daemon:
             propose_moc_suggestions,
         )
         from .moc_suggestion_queue import (
-            derive_default_queue_path,
+            resolve_queue_path,
             upsert_proposals,
         )
-        from pathlib import Path as _Path
 
-        # Resolve queue path — config override OR derived from state.
-        if cfg.queue_path:
-            queue_path = _Path(cfg.queue_path)
-        else:
-            queue_path = derive_default_queue_path(self.cfg.state.path)
+        # Resolve queue path — config override OR derived from state. THE
+        # shared derivation, not a local spelling of it: the brief's reader and
+        # the act router's ledger write resolve through the same function (via
+        # ``config.resolve_moc_queue_path``), so the file this stage writes is
+        # the file they read by construction rather than by three functions
+        # happening to agree. ``state.path`` always carries a value (its
+        # dataclass default), so this never returns ``None`` here.
+        queue_path = resolve_queue_path(
+            explicit=cfg.queue_path, state_path=self.cfg.state.path,
+        )
 
         # Build the MOC index ONCE per sweep (vault read).
         # ``build_existing_mocs_index`` returns ``(index, moc_dir_exists)``.

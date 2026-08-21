@@ -769,6 +769,16 @@ def moc_suggestion_feed_items(
     log.info(
         "brief.moc_suggestion.queue_readout",
         instance=instance,
+        # THE POSITIVE OBSERVATION — the file this read actually consulted, and
+        # the counterpart to the caller's no-surveyor idle line. Zero counts on
+        # their own cannot tell "the queue is genuinely empty" from "the reader
+        # resolved somewhere nothing writes"; naming the path makes the healthy
+        # case produce evidence a broken resolver could not, which is precisely
+        # what was missing while this producer went a whole deployment without
+        # being called at all. ``queue_exists`` separates "no file yet" (the
+        # surveyor has not enqueued) from "file present, nothing pending".
+        queue_path=str(queue_path),
+        queue_exists=Path(queue_path).exists(),
         pending=len(pending),
         actionable=len(actionable),
         deferred_propose_new=len(deferred_new),

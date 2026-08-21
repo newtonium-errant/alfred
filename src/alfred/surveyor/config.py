@@ -365,6 +365,50 @@ def load_config(config_path: str | Path) -> PipelineConfig:
     )
 
 
+def resolve_moc_queue_path(raw: dict | None) -> Path | None:
+    """The MOC suggestion queue file for a unified config, or ``None``.
+
+    THE single parse of this key for every consumer OUTSIDE the surveyor —
+    the brief's reader and the act router's ledger write both come through
+    here (each stamping the result onto its own config at load time), so they
+    cannot resolve to different files. It lives in the surveyor's config
+    module because the surveyor OWNS the queue: it is the only writer of the
+    rows, and the derivation has to track its defaults, not a copy of them.
+
+    Two traps this closes, both of which produced ``None`` for every real
+    config before it existed:
+
+    * The consumers used ``getattr(config, "surveyor", ...)`` against typed
+      dataclasses that never declared a ``surveyor`` field. ``getattr`` with a
+      default cannot raise, so a field that does not exist is indistinguishable
+      from a value that is unset — the resolver manufactured ``None`` forever
+      and the feature never ran.
+    * Reading ``surveyor.state.path`` straight off the raw dict is NOT
+      equivalent to what the surveyor does. ``StateConfig.path`` carries a
+      DEFAULT, so a config with a ``surveyor:`` block and no ``state:`` key
+      still enqueues (to the default's sibling) — a raw read would answer
+      "no queue" about a queue that is actively being written. Building the
+      two blocks through ``_build_dataclass`` applies the same defaults, and
+      ``_walk_and_substitute`` applies the same ``${VAR}`` expansion, that
+      :func:`load_from_unified` does.
+
+    ``None`` means exactly one thing: this config has no ``surveyor:`` block,
+    so the instance cannot enqueue a suggestion and there is no queue to read.
+    That is a true, checkable reason — which is what lets the callers' idle
+    logs claim it.
+    """
+    if not isinstance(raw, dict):
+        return None
+    if not isinstance(raw.get("surveyor"), dict):
+        return None
+    from .moc_suggestion_queue import resolve_queue_path
+
+    tool = _walk_and_substitute(raw).get("surveyor") or {}
+    moc = _build_dataclass(MocSuggestionConfig, tool.get("moc_suggestion"))
+    state = _build_dataclass(StateConfig, tool.get("state"))
+    return resolve_queue_path(explicit=moc.queue_path, state_path=state.path)
+
+
 def load_from_unified(raw: dict) -> PipelineConfig:
     """Build PipelineConfig from a pre-loaded unified config dict."""
     from alfred.vault.config_helpers import normalize_vault_block

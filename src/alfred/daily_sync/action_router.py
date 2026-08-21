@@ -2652,13 +2652,48 @@ def _dispatch_moc_apply(
             True, STATUS_ACTED, "nothing left to add", feed_item_id, action_id,
         )
 
+    # RESOLVED BEFORE THE VAULT WRITE, and the ordering is the invariant: a
+    # VAULT WRITE MUST NOT OUTLIVE ITS LEDGER UPDATE. These two lines used to
+    # sit six lines BELOW ``apply_membership``, so an affirm on a config whose
+    # queue would not resolve wrote every member's ``mocs:`` and then silently
+    # failed to flip the row to ``applied`` — the record and its ledger
+    # diverging, with the divergence announced only by an INFO line whose
+    # wording ("no suggestion id on the card, or no queue path in config")
+    # reads as a benign skip. A missing ledger row is worse than a wrong one
+    # because absence is what nobody notices: the row stays ``pending`` and the
+    # card is re-proposed for work already done.
+    #
+    # Resolving first turns an unrecoverable half-write into a refusal that
+    # costs nothing. It is scoped to the case where a ledger update is actually
+    # REQUIRED — a card carrying a ``suggestion_id`` has a row to flip, so an
+    # unresolvable queue is fatal to it; a card without one has no ledger to
+    # diverge from and proceeds exactly as before. What remains belt-swallowed
+    # below is the I/O failure (disk error mid-write), which is not predictable
+    # from config and is already logged with its consequence named. This closes
+    # the half that IS predictable.
+    suggestion_id = str(evidence.get("suggestion_id") or "")
+    queue_path = _moc_queue_path(config)
+    if suggestion_id and queue_path is None:
+        log.error(
+            "feed.act.moc.queue_unresolved",
+            id=feed_item_id, suggestion_id=suggestion_id, target=chosen,
+            members=len(members),
+            consequence="REFUSED BEFORE THE VAULT WRITE — nothing was written, "
+                        "so the queue row and the records still agree",
+            reason="this card carries a suggestion_id (a queue row exists to "
+                   "flip) but no surveyor: block in this config resolves a "
+                   "queue path — applying would strand the row at pending",
+        )
+        return ActResult(
+            False, STATUS_ERROR,
+            "can't reach the suggestion queue — nothing applied",
+            feed_item_id, action_id,
+        )
+
     result = apply_membership(
         Path(vault_path), member_rel_paths=members,
         target_moc_rel_path=chosen,
     )
-
-    suggestion_id = str(evidence.get("suggestion_id") or "")
-    queue_path = _moc_queue_path(config)
 
     # THE CORRECTION SIGNAL (self-correcting standard, part 1), captured
     # BEFORE the queue bookkeeping so a queue failure cannot cost the
@@ -2726,11 +2761,20 @@ def _dispatch_moc_apply(
                             "pending — it will be re-proposed",
             )
     else:
+        # ONE cause reaches here now, and the reason says so. It used to read
+        # "no suggestion id on the card, OR no queue path in config" — true
+        # when written, false the moment the unresolved-queue case above began
+        # refusing before the write. The second disjunct can no longer arrive:
+        # a card with a suggestion_id and no queue path returns early, and one
+        # with both takes the branch above. Leaving the old wording would point
+        # the next reader at a config problem for a card that simply carries no
+        # row to flip.
         log.info(
             "feed.act.moc.queue_update_skipped", id=feed_item_id,
-            suggestion_id=suggestion_id or "(none)",
-            queue_path=str(queue_path or "(unresolved)"),
-            reason="no suggestion id on the card, or no queue path in config",
+            suggestion_id="(none)",
+            queue_path=str(queue_path or "(no surveyor block)"),
+            reason="the card carries no suggestion_id, so there is no queue "
+                   "row to flip — the vault write is the whole of this act",
         )
 
     log.info(
@@ -2764,27 +2808,26 @@ def _dispatch_moc_apply(
 
 
 def _moc_queue_path(config: Any) -> Path | None:
-    """Resolve the suggestion queue from the surveyor's own config.
+    """The suggestion queue this instance's surveyor enqueues into.
 
-    ONE derivation, shared with the producer's read side by construction:
-    the explicit ``queue_path`` when set, otherwise the surveyor state
-    path's sibling — exactly what ``daemon.py`` does when it enqueues. A
-    second spelling here would let the reader and the writer resolve to
-    different files, which is the failure the sort rotation's
-    ``corrections_path_for`` helper exists to prevent.
+    ONE derivation, shared with the producer's read side by construction —
+    but by CONSTRUCTION now rather than by assertion. Both sides read a
+    declared ``moc_queue_path`` field that their loaders stamp through the
+    same ``surveyor.config.resolve_moc_queue_path`` call on the same raw
+    dict, so the file this router flips a row in is the file the brief dealt
+    the card from.
+
+    IT DID NOT USED TO BE. This function walked ``getattr(config, "surveyor",
+    None)`` against ``DailySyncConfig``, which has no ``surveyor`` field — the
+    lookup could not raise, so it returned ``None`` for every config forever
+    and the ledger write-back never ran on any instance. The docstring above
+    it claimed the two sides shared one derivation; they shared one BUG, which
+    is self-consistent and therefore invisible. Hence the declared field and a
+    plain attribute read: a dropped or renamed field is an AttributeError at
+    this line, not another decade of plausible silence.
     """
-    from alfred.surveyor.moc_suggestion_queue import derive_default_queue_path
-
-    surveyor = getattr(config, "surveyor", None) or {}
-    moc_cfg = getattr(surveyor, "moc_suggestion", None)
-    explicit = getattr(moc_cfg, "queue_path", None) if moc_cfg else None
-    if explicit:
-        return Path(str(explicit))
-    state = getattr(surveyor, "state", None)
-    state_path = getattr(state, "path", None) if state else None
-    if state_path:
-        return derive_default_queue_path(str(state_path))
-    return None
+    path = config.moc_queue_path
+    return Path(path) if path else None
 
 
 # --- slot_suggestion accept (board day-planning path) ------------------------
