@@ -67,12 +67,22 @@ class ScopeError(Exception):
 # instance"). The empty dict ``{}`` and the missing key both deny
 # all types.
 #
+# A ROW IN THIS TABLE BINDS ONLY WHERE THE SCOPE IS THREADED. Every
+# body-mutation check lives behind ``if scope is not None`` in
+# ``ops.vault_edit``, so a caller that omits ``scope=`` gets NONE of
+# these rules — the row describes what WOULD apply, not what does.
+# Known gap (measured 2026-08-21, master 8c5aac11):
+# ``instructor/executor.py`` omits it, so the ``instructor`` row above
+# is currently inert. The talker and batch callers thread theirs.
+# Check the call site before relying on a row here.
+#
 # Universally-denied types — auto-generated/atomic records. These
-# refuse body_insert_at AND body_replace under EVERY scope, regardless
+# refuse body_insert_at AND body_replace under EVERY SCOPE, regardless
 # of the per-instance allowlist. An instance putting one of these in
 # its allowlist still gets denied at the type-gate. Mutation here =
 # history corruption (transcripts) or learning-record contradiction
-# (epistemic atoms).
+# (epistemic atoms). Note "every scope" is exactly the limit: a call
+# that passes NO scope never reaches this set at all.
 _BODY_MUTATE_DENIED_TYPES: frozenset[str] = frozenset({
     # Auto-generated transcripts / event records.
     "session", "conversation", "capture", "run", "input",
@@ -384,11 +394,18 @@ def _check_body_mutation_allowed(
         and the existing record has ``gcal_event_id`` set (would lose
         GCal sync state on rewrite). The remedy named in the refusal is
         SCOPE-AWARE (see :func:`_gcal_replace_remedy`): a delete-capable
-        scope is pointed at delete-then-recreate, while the scopes that
-        can actually reach this rule — ``talker`` and ``instructor``,
+        scope is pointed at delete-then-recreate, while the delete-less
+        scopes this rule is written for — ``talker`` and ``instructor``,
         both ``delete: False`` — are pointed at body_append /
         body_insert_at, because naming an operation the caller is
         forbidden from performing is worse than naming none.
+        CAVEAT ON "reach" (measured 2026-08-21, master 8c5aac11): of
+        those two only ``talker`` reaches this rule in production.
+        ``instructor/executor.py`` calls ``ops.vault_edit`` without
+        ``scope=``, so no in-``ops`` check_scope fires on that path and
+        the instructor's remedy branch is currently DEAD CODE — correct
+        if the scope is ever threaded, unexercised until then. See the
+        ``SCOPE_RULES["instructor"]`` comment for the enumeration.
         Refuse-at-scope keeps the contract centralised; the
         sync-layer-preserves alternative would have to live in
         every future sync hook.
@@ -1348,12 +1365,37 @@ SCOPE_RULES: dict[str, dict[str, bool | str | set[str]]] = {
         # existing record body.
         "allow_body_writes": True,
         # Instructor — operator-driven, trusted path. ``"*"`` wildcard
-        # means "any type passes the allowlist gate" — but the
-        # universal-deny set in _BODY_MUTATE_DENIED_TYPES still
-        # refuses session/conversation/learning records. Operator can
-        # override by directly editing the file outside the
-        # alfred_instructions watcher (operator has filesystem
-        # access; the gate guards only the agent path).
+        # means "any type passes the allowlist gate" — and when this
+        # scope is threaded, the universal-deny set in
+        # ``_BODY_MUTATE_DENIED_TYPES`` still refuses session /
+        # conversation / learning records. Operator can override by
+        # directly editing the file outside the alfred_instructions
+        # watcher (operator has filesystem access; the gate guards only
+        # the agent path).
+        #
+        # THESE THREE KEYS ARE CURRENTLY UNREACHED FROM THE INSTRUCTOR'S
+        # OWN EXECUTOR (measured 2026-08-21, master 8c5aac11).
+        # ``instructor/executor.py`` calls ``ops.vault_edit`` /
+        # ``vault_create`` / ``vault_move`` WITHOUT ``scope=``, and every
+        # in-``ops`` scope check sits behind ``if scope is not None``, so
+        # ``allow_body_writes`` / ``allow_body_insert_at`` /
+        # ``allow_body_replace`` never fire on that path. The executor's
+        # own pre-dispatch ``check_scope("instructor", op, ...)`` IS live,
+        # but it is op-level only (it denies ``delete``) and passes
+        # ``record_type=""`` for every edit, so no per-type rule here can
+        # discriminate. The talker (``scope=active_scope``) and batch
+        # (``scope=BATCH_SCOPE``) callers DO thread it; the instructor is
+        # the sole omission among the three.
+        #
+        # So the deny-set sentence above describes THIS MATRIX, not
+        # today's instructor behaviour. Threading is proposed and
+        # unratified — it would newly refuse body_replace /
+        # body_insert_at on the deny-set types, body_replace on a
+        # gcal-synced event, and every body surface on an
+        # ``ingested_via`` record, while leaving every surface the
+        # vault-instructor SKILL advertises (set_fields / append_fields /
+        # body_append) allowed. Enumeration pinned both directions in
+        # ``tests/test_instructor_scope_truth.py``.
         "allow_body_insert_at": {"*": True},
         "allow_body_replace": {"*": True},
     },
