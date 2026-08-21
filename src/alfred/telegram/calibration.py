@@ -10,6 +10,18 @@ user, stored as a marker-wrapped body block on the user's `person` record:
     - ...
     <!-- END ALFRED:CALIBRATION -->
 
+STILL ORPHANED, NOW GATED — R4 in progress (2026-08-20).
+
+STATUS, so the census below is not read as current: the write side now
+runs under the ``calibration_apply`` vault scope by DEFAULT
+(``apply_proposals(scope=...)``), replacing the unrestricted
+``scope=None`` write it shipped with. That is the guardrail half of R4.
+The module still has NO production caller — the capture, propose-surface
+and apply doors are not yet wired — so the "nothing in src imports this"
+line below remains true of CALLERS and is now false of imports: this
+module imports ``alfred.vault.scope`` at load. The remaining R4 work is
+the three doors, not the gate.
+
 ORPHANED BUT KEPT — REWIRE FLAG R4 (XS-BATCH9 item 5 adjudication,
 2026-08-20; the eleventh orphan the T5 lane found and left for its own
 verdict). Both doors died with the Telegram retirement: the read side
@@ -55,6 +67,7 @@ from pathlib import Path
 from typing import Any, Final
 
 from alfred._anthropic_compat import messages_create_kwargs
+from alfred.vault.scope import CALIBRATION_APPLY_SCOPE
 from .utils import get_logger
 
 log = get_logger(__name__)
@@ -325,6 +338,7 @@ def apply_proposals(
     confirmation_dial: int = DEFAULT_CONFIRMATION_DIAL,
     *,
     agent_slug: str = "salem",
+    scope: str | None = CALIBRATION_APPLY_SCOPE,
 ) -> dict[str, Any]:
     """Apply the proposals to the user's calibration block.
 
@@ -338,6 +352,24 @@ def apply_proposals(
     legacy callers and tests that skip the plumb preserve their
     behaviour. Pass :func:`alfred.audit.agent_slug_for(config)` from
     production call sites.
+
+    ``scope`` is the vault scope the write runs under, and it DEFAULTS TO
+    THE RESTRICTIVE ONE (:data:`~alfred.vault.scope.CALIBRATION_APPLY_SCOPE`)
+    rather than to ``None``. That direction is deliberate and is the whole
+    point of the R4 gate.
+
+    This function previously wrote with ``scope=None`` — unrestricted, since
+    ``vault_edit`` skips ``check_scope`` entirely when scope is falsy. Making
+    the gate an OPTIONAL parameter defaulting to ``None`` would have
+    reproduced the standing trap: the tests thread it, production never does,
+    every pin stays green, and the feature is accepted-then-ignored in the
+    field. Defaulting to the scope inverts that — a caller must now opt OUT
+    explicitly and visibly to get an unrestricted write, and any future call
+    site is gated the moment it is written, whether or not its author knew
+    the gate existed.
+
+    Passing ``scope=None`` is still honoured for the manual-CLI escape hatch,
+    but no production path should use it.
 
     Dial behaviour:
         - 0: nothing is written (returned immediately).
@@ -460,6 +492,7 @@ def apply_proposals(
             rel,
             set_fields={"attribution_audit": merged_fm["attribution_audit"]},
             body_rewriter=_rewriter,
+            scope=scope,
         )
     except Exception as exc:  # noqa: BLE001
         log.warning(

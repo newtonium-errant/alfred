@@ -268,10 +268,23 @@ KIND_DEFAULTS: dict[str, tuple[str, str]] = {
     # notification flood, and a backlog-grooming card is the last thing that
     # earns a doorbell — it is work he chose to defer, by definition.
     #
-    # FYI costs the card nothing it needs. ``isDeckDealt`` deals any non-slot
-    # kind that has a wired verb, whatever its mode, so the rotation still
-    # reaches the deck; ``attribution`` is the shipped precedent (FYI/FYI, three
-    # verbs, deck-dealt). What FYI DOES add is the universal ack
+    # FYI costs the card nothing it needs, because it carries a co-equal
+    # choice group and therefore clears ``isDeckCandidate``.
+    #
+    # CORRECTION (2026-08-20, R4), recorded AT the claim because the next
+    # reader meets it here rather than in commit history: this comment used to
+    # cite ``attribution`` as "the shipped precedent (FYI/FYI, three verbs,
+    # deck-dealt)". That is a pre-``isDeckCandidate`` FOSSIL and it is exactly
+    # backwards. ``deck.tsx`` filters by ``isDeckCandidate`` FIRST and only
+    # then by ``isDeckDealt``, and ``isDeckCandidate`` is ``mode === 'decide'
+    # || hasSuggestedChoice(item)`` — so an FYI card with gestured-but-
+    # UNGROUPED verbs never reaches the deck at all. ``attribution`` is the
+    # named COUNTER-example on both sides: ``feedConstants.ts`` cites it in
+    # ``isDeckCandidate``'s own docstring as the reason the rule is not
+    # ``isDeckDealt ∧ fyi``, and ``web/tests/holdPrimitive.test.ts`` pins
+    # ``isDeckCandidate(fyiAttribution) === false``. A quiet card reaches the
+    # deck through its suggestion GROUP, never through its verbs.
+    # What FYI DOES add is the universal ack
     # (``action_router`` gates ack on ``mode == MODE_FYI``): acking a card that
     # is still unslotted revives it on the next fire, because this is an episode
     # kind. That is honest — it IS still unsorted — but the defer verbs are the
