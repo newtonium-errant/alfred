@@ -729,6 +729,27 @@ async def test_remove_accepts_no_fields_at_all(
     assert parsed["unsupported_fields"] == ["priority"], parsed
     # The item survives the refusal.
     assert len(_items(vault, "Core Daily")) == 1
+    # The REASON must be accurate about a field whose NAME is correct.
+    # ``priority`` is valid on add AND edit — the problem is the action,
+    # not the spelling. An "-only" phrasing here would state something
+    # false and send the model hunting for a typo that isn't there.
+    assert "valid on: add, edit" in parsed["error"], parsed["error"]
+    assert "-only" not in parsed["error"], parsed["error"]
+
+
+def test_wrong_action_refusal_enumerates_the_actions_a_field_is_valid_on(
+) -> None:
+    """Unit-level companion to the case above, across both shapes.
+
+    An edit-only switch says 'valid on: edit'; an add+edit field says
+    'valid on: add, edit'. Neither collapses to an "-only" claim that
+    would be false for the second.
+    """
+    edit_only = cli_items.describe_unsupported_field("clear_due_pattern", "add")
+    assert "valid on: edit" in edit_only, edit_only
+
+    both = cli_items.describe_unsupported_field("priority", "remove")
+    assert "valid on: add, edit" in both, both
 
 
 @pytest.mark.asyncio

@@ -415,14 +415,20 @@ def describe_unsupported_field(name: str, action: str) -> str:
 
     own = _SPEC_BY_NAME.get(name)
     if own is not None and name not in accepted:
-        # Real field, wrong action (e.g. a clear_* switch on an add). Name
-        # the action, not the field, as the problem — the caller's field
-        # name is correct and telling them otherwise would send them
-        # hunting for a spelling error that isn't there.
-        only = "edit" if "edit" in own.actions else "add"
+        # Real field, wrong action (e.g. a clear_* switch on an add, or ANY
+        # field on a remove). Name the action, not the field, as the
+        # problem — the caller's field name is correct and telling them
+        # otherwise would send them hunting for a spelling error that isn't
+        # there.
+        #
+        # The valid-actions list is ENUMERATED from the spec rather than
+        # collapsed to "X-only": ``priority`` on a ``remove`` is valid on
+        # BOTH add and edit, so an "-only" phrasing would state something
+        # false about a field whose name the caller got right.
+        valid = ", ".join(sorted(own.actions))
         return (
             f"{name!r} is not accepted on action={action!r} "
-            f"(it is {only}-only) — {own.meaning}."
+            f"(it is valid on: {valid}) — {own.meaning}."
         )
 
     near = difflib.get_close_matches(name, accepted, n=1, cutoff=0.55)
