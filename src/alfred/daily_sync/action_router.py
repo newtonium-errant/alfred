@@ -1685,6 +1685,14 @@ def _dispatch_slot_snooze(
     # ``compute_today_view`` drops the entry before a card is built. The honest
     # answer for a snooze on a cancelled item is the folded gate's
     # ``already_acted``, which is what the pin asserts.
+    #
+    # FOLLOW-UP (out of scope for #103, deliberately not fixed here): the
+    # ``acted_action in DONE_FAMILY`` clause below is PRE-EXISTING dead code by
+    # the same measurement — it can never be true at this point in the flow. It
+    # is left exactly as found rather than removed, because deciding between
+    # "delete the clause" and "make the gate able to see the verb" is a change to
+    # the snooze guard's contract, and that belongs to whoever owns that
+    # question, not to the lane that happened to measure it.
     if bool(evidence.get("done")) or getattr(item, "acted_action", None) in DONE_FAMILY:
         log.info(
             "board.snooze.refused_already_done", id=feed_item_id, action=action_id,

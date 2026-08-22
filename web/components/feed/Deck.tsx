@@ -856,6 +856,14 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
               <p className={`${OVERLAY_TITLE_CLASS} ${ROLE_TEXT_CLASS.caution}`}>
                 Snooze for
               </p>
+              {/* "Close", not "Cancel" (#103). This dismiss button read
+                  "Cancel" until the WHETHER rung below joined the same dialog —
+                  at which point one word named two controls with OPPOSITE
+                  meanings: dismiss the menu, and cancel the task. "Close" is
+                  already this surface's dismiss word (the snoozed drill above
+                  uses it), so this is a convergence, not a new coinage. The
+                  data-testid is deliberately UNCHANGED: both pins that click
+                  this element address it by testid, so neither moved. */}
               <button
                 type="button"
                 data-testid="deck-snooze-cancel"

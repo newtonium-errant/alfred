@@ -2019,13 +2019,15 @@ def _task_is_done_today(fm: dict, today: date) -> bool:
 
     CANCELLED IS NOT DONE (#103), and this docstring used to say it was
     ("status is closed (done/cancelled)") — with the code agreeing. That was
-    defensible only while nothing wrote ``cancelled`` at runtime: the status was
-    reachable through a conversation with Salem or a one-shot migration, and
-    ``cancelled_at`` is not among the completion-date keys below, so such a task
-    fell through to the unconditional ``return True`` and counted as an
-    achievement. Once the board can cancel in one tap, that is the operator's
-    own complaint — *"I don't want to mark it done"* — implemented as a
-    feature. A cancellation is the ABSENCE of an achievement, not a cheap one.
+    never merely theoretical: ``vault-talker/SKILL.md`` names
+    ``set_fields {"status": "cancelled"}`` as the RECOMMENDED DEFAULT when the
+    operator asks Salem to remove a task, and ``cancelled_at`` is not among the
+    completion-date keys below, so every such task fell through to the
+    unconditional ``return True`` and was counted toward the daily goal as
+    something he had COMPLETED. The board verb makes that path one tap instead of
+    one conversation; it did not create it. Either way it is the operator's own
+    complaint — *"I don't want to mark it done"* — implemented as a feature.
+    A cancellation is the ABSENCE of an achievement, not a cheap one.
 
     Defence in depth rather than the live path: ``compute_today_view`` now drops
     cancelled task entries from the lanes outright, so a cancelled record should
@@ -2174,9 +2176,18 @@ def compute_today_view(
     # today's list, so nothing re-asks the record whether it still wants to be
     # there.
     #
-    # That asymmetry was harmless while nothing wrote ``cancelled`` at runtime.
-    # It stops being harmless the moment the board can: MEASURED at
-    # c552fa09 on a curated T1 whose record was cancelled, ``compute_today_view``
+    # THAT ASYMMETRY IS A LIVE DEFECT, NOT A LATENT ONE, and this comment said
+    # the opposite until it was checked. The first draft read "harmless while
+    # nothing wrote ``cancelled`` at runtime" — false: ``vault-talker/SKILL.md``
+    # instructs Salem that ``set_fields {"status": "cancelled"}`` is the
+    # RECOMMENDED DEFAULT when the operator asks to remove a task, so every task
+    # he has ever asked Salem to cancel has been counted toward his daily goal as
+    # something he COMPLETED. The board verb below does not introduce this bug; it
+    # makes it frequent. Corrected here rather than only in commit history,
+    # because this comment is where the next reader meets the claim.
+    #
+    # MEASURED at c552fa09 on a curated T1 whose record was cancelled,
+    # ``compute_today_view``
     # reported ``t1_count=1 t1_done=1 all_t1_done=True`` — because
     # ``_task_is_done_today`` treats every closed status as done, and
     # ``cancelled_at`` is not one of the completion-date keys it checks. So a
