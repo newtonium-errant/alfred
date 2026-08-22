@@ -36,6 +36,8 @@ import asyncio
 
 import pytest
 
+from alfred.health.agent_failure import AgentCallOutcomes
+
 from alfred.curator import process as curator_process
 from alfred.curator.config import ClaudeBackendConfig as CuratorClaudeConfig
 from alfred.distiller import pipeline as distiller_pipeline
@@ -182,6 +184,7 @@ def test_distiller_call_llm_raises_on_unknown_backend() -> None:
                 config=cfg,
                 session_path="/tmp/nonexistent-session",
                 stage_label="test-stage",
+                outcomes=AgentCallOutcomes(),
             )
         )
     msg = str(exc_info.value)
@@ -203,6 +206,7 @@ def test_distiller_call_llm_raises_on_typo_backend() -> None:
                 config=cfg,
                 session_path="/tmp/nonexistent-session",
                 stage_label="test-stage",
+                outcomes=AgentCallOutcomes(),
             )
         )
     assert "clawd" in str(exc_info.value)

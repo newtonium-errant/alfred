@@ -13,6 +13,14 @@ Probes:
     (added 2026-05-10 as part of the cross-daemon BIT-probe arc).
     Distiller's expected interval is hourly (default
     ``extraction.interval_seconds = 3600``); thresholds reflect that.
+  * agent-failure-kind — whether ``claude -p`` is currently failing
+    (2026-08-22). Answers what last-successful-extraction cannot: a run
+    is recorded whether or not the LLM calls inside it succeeded, so an
+    extraction cycle can tick on schedule with nothing being extracted.
+    It did, against a green ``distiller ok`` — 246 logged failures,
+    measured on the box 2026-08-22 ~12:00 UTC (point-in-time).
+    Severity mapping shared with curator and janitor in
+    ``alfred.health.agent_failure``.
 """
 
 from __future__ import annotations
@@ -23,6 +31,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from alfred.health.agent_failure import agent_failure_check
 from alfred.health.aggregator import register_check
 from alfred.health.anthropic_auth import check_anthropic_auth, resolve_api_key
 from alfred.health.claude_cli_auth import check_claude_cli_auth, resolve_claude_command
@@ -358,6 +367,64 @@ def _check_last_successful_extraction(raw: dict[str, Any]) -> CheckResult:
     )
 
 
+#: What stops while distiller's agent backend is down. One sentence, used in
+#: every severity branch of the shared probe. Distiller's failure is the
+#: quietest of the three — the vault looks unchanged either way — so the
+#: sentence has to name the ACCUMULATING cost, not just the stopped work.
+DISTILLER_AGENT_CONSEQUENCE = (
+    "knowledge extraction is stopped — no learn records are being created, "
+    "and the sources that qualified stay unprocessed."
+)
+
+
+def _read_distiller_agent_failure(state_path: Path) -> tuple[dict | None, str]:
+    """Read the ``(last_agent_failure, last_agent_success)`` pair from state.
+
+    Inline dict-walk rather than constructing ``DistillerState`` — matches
+    ``_read_distiller_most_recent_run`` and keeps a corrupt state file from
+    crashing the BIT run. A missing/malformed pair degrades to ``(None, "")``,
+    which the probe reads as "nothing has failed".
+    """
+    if not state_path.is_file():
+        return None, ""
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None, ""
+    failure = data.get("last_agent_failure")
+    success = data.get("last_agent_success")
+    return (
+        failure if isinstance(failure, dict) else None,
+        success if isinstance(success, str) else "",
+    )
+
+
+def _check_agent_failure_kind(raw: dict[str, Any]) -> CheckResult:
+    """Distiller's ``agent-failure-kind`` probe.
+
+    Same severity mapping as curator's and janitor's, from the same function —
+    see :func:`alfred.health.agent_failure.agent_failure_check`. Added
+    2026-08-22, when distiller was measured logging 246 quota-failure lines
+    (on the box, ~12:00 UTC — point-in-time) while its BIT line read
+    ``distiller ok``.
+
+    The recovery comparison uses ``last_agent_success``, NOT the run timestamps
+    ``_check_last_successful_extraction`` reads. ``add_run`` fires at the end of
+    every extraction regardless of what the stage calls did — and
+    ``PipelineResult.success`` is set True unconditionally — so a run in which
+    every LLM call failed still records as a run. The two probes answer
+    different questions: that one asks "did an extraction cycle happen?", this
+    one asks "did the work inside it succeed?"
+    """
+    state_path = _resolve_distiller_state_path(raw)
+    failure, last_success = _read_distiller_agent_failure(state_path)
+    return agent_failure_check(
+        failure=failure,
+        last_success_ts=last_success,
+        consequence=DISTILLER_AGENT_CONSEQUENCE,
+        state_path=state_path,
+    )
+
 async def health_check(raw: dict[str, Any], mode: str = "quick") -> ToolHealth:
     """Run distiller health checks.
 
@@ -397,6 +464,11 @@ async def health_check(raw: dict[str, Any], mode: str = "quick") -> ToolHealth:
         results.append(await check_claude_cli_auth(command=resolve_claude_command(raw)))
 
     results.append(_check_last_successful_extraction(raw))
+    # Runs unconditionally, NOT gated on ``backend == "claude"`` like the two
+    # auth probes above. Those probe a live credential surface only the claude
+    # backend has; this one reads a recorded failure, and a failure recorded
+    # before a backend switch is still the last thing that happened.
+    results.append(_check_agent_failure_kind(raw))
 
     status = Status.worst([r.status for r in results])
     return ToolHealth(tool="distiller", status=status, results=results)

@@ -19,6 +19,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from alfred.health.agent_failure import AgentCallOutcomes
 from alfred.vault.mutation_log import log_mutation, read_mutations
 from alfred.vault.ops import VaultError, vault_edit, vault_read
 
@@ -247,8 +248,19 @@ async def _call_llm(
     config: DistillerConfig,
     session_path: str,
     stage_label: str,
+    *,
+    outcomes: AgentCallOutcomes,
 ) -> str:
-    """Make an LLM call via the configured backend and return text output."""
+    """Make an LLM call via the configured backend and return text output.
+
+    ``outcomes`` is REQUIRED, not an optional sink with a ``None`` default.
+    This is the one function in the distiller that knows whether an agent call
+    succeeded, and the tool that owns the state file is four frames up — an
+    optional parameter here would be threaded by tests, defaulted in
+    production, and every pin would stay green while the probe it feeds read
+    an empty state field forever. Making it required means a caller that forgets
+    it does not run at all.
+    """
     backend_name = config.agent.backend
     vault_path = str(config.vault.vault_path)
 
@@ -306,6 +318,11 @@ async def _call_llm(
             stdout_tail=raw_stdout[-2000:] if raw_stdout else "",
             stderr=raw_stderr[:500],
         )
+        # 2026-08-22 — carry the classified failure up to the state owner. Until
+        # now ``kind`` reached this log line and stopped: a green
+        # ``distiller ok`` on the BIT line through 246 failing calls (box,
+        # 2026-08-22 ~12:00 UTC).
+        outcomes.record_failure(result.kind, result.summary)
         # Return raw stdout (may be empty) rather than the backend's
         # error-summary string like "Exit code 1: ". The caller's
         # "if not manifest and stdout" guard short-circuits parsing when
@@ -314,6 +331,7 @@ async def _call_llm(
         # pipeline.manifest_parse_failed stdout_len=13 log entry with
         # no real signal.
         return raw_stdout
+    outcomes.record_success()
     log.info(
         "pipeline.llm_completed",
         stage=stage_label,
@@ -332,6 +350,8 @@ async def _stage1_extract(
     existing_learns: list[VaultRecord],
     config: DistillerConfig,
     session_path: str,
+    *,
+    outcomes: AgentCallOutcomes,
 ) -> list[dict]:
     """Stage 1: Analyze one source record and return learning candidates as JSON."""
     template = _load_stage_prompt("stage1_extract.md")
@@ -380,7 +400,9 @@ async def _stage1_extract(
         # interfere — the path embedded in the prompt stays the same across
         # retries (it was already baked in above), but we still need to read
         # from the exact path the prompt references.
-        stdout = await _call_llm(prompt, config, session_path, stage_label)
+        stdout = await _call_llm(
+            prompt, config, session_path, stage_label, outcomes=outcomes
+        )
 
         # Primary: read manifest from the temp file the LLM was instructed to write
         try:
@@ -640,6 +662,8 @@ async def _stage3_create(
     spec: LearningSpec,
     config: DistillerConfig,
     session_path: str,
+    *,
+    outcomes: AgentCallOutcomes,
 ) -> str | None:
     """Stage 3: Create one learning record. Returns path of created record."""
     template = _load_stage_prompt("stage3_create.md")
@@ -710,7 +734,9 @@ async def _stage3_create(
     # cluster is cheap relative to the write loss.
     max_attempts = 2
     for attempt in range(1, max_attempts + 1):
-        stdout = await _call_llm(prompt, config, session_path, stage_label)
+        stdout = await _call_llm(
+            prompt, config, session_path, stage_label, outcomes=outcomes
+        )
         if stdout:
             break
         if attempt < max_attempts:
@@ -896,6 +922,8 @@ def _format_cluster_for_llm(cluster: dict) -> str:
 async def run_meta_analysis(
     config: DistillerConfig,
     session_path: str,
+    *,
+    outcomes: AgentCallOutcomes,
 ) -> int:
     """Pass B: Cross-learning meta-analysis. Returns count of meta-records created."""
     vault_path = config.vault.vault_path
@@ -941,7 +969,9 @@ async def run_meta_analysis(
         )[:30]
         stage_label = f"passb-{safe_label}"
 
-        await _call_llm(prompt, config, session_path, stage_label)
+        await _call_llm(
+            prompt, config, session_path, stage_label, outcomes=outcomes
+        )
 
         # Count new creations
         after_created = set(
@@ -974,6 +1004,8 @@ async def run_pipeline(
     batch: ExtractionBatch,
     config: DistillerConfig,
     session_path: str,
+    *,
+    outcomes: AgentCallOutcomes,
 ) -> PipelineResult:
     """Run the multi-stage distiller pipeline on one extraction batch.
 
@@ -997,6 +1029,7 @@ async def run_pipeline(
             existing_learns=batch.existing_learns,
             config=config,
             session_path=session_path,
+            outcomes=outcomes,
         )
         all_manifests[source.record.rel_path] = manifest
 
@@ -1020,7 +1053,9 @@ async def run_pipeline(
     # --- Pass A: Stage 3 — Create ---
     created_paths: list[str] = []
     for spec in specs:
-        created_path = await _stage3_create(spec, config, session_path)
+        created_path = await _stage3_create(
+            spec, config, session_path, outcomes=outcomes
+        )
         if created_path:
             lt = spec.learn_type
             result.records_created[lt] = result.records_created.get(lt, 0) + 1
@@ -1126,6 +1161,8 @@ async def run_consolidation(
     config: DistillerConfig,
     skills_dir: Path,
     session_path: str,
+    *,
+    outcomes: AgentCallOutcomes,
 ) -> int:
     """Consolidation sweep: merge duplicates, upgrade assumptions, resolve contradictions.
 
@@ -1169,7 +1206,9 @@ async def run_consolidation(
         )
 
         stage_label = f"consolidate-{learn_type}"
-        await _call_llm(prompt, config, session_path, stage_label)
+        await _call_llm(
+            prompt, config, session_path, stage_label, outcomes=outcomes
+        )
 
         log.info("pipeline.consolidation_type_done", learn_type=learn_type, records=len(type_records))
 

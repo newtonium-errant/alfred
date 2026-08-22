@@ -10,6 +10,13 @@ from pathlib import Path
 
 import structlog
 
+from alfred.health.agent_failure import (
+    SUSTAINED_FAILURE_STREAK,
+    failure_superseded_by_success,
+    next_failure_record,
+    read_streak,
+)
+
 from .issues import FixLogEntry, SweepResult
 
 log = structlog.get_logger()
@@ -63,6 +70,22 @@ class JanitorState:
         # operators see WHY the sweep stalled, not just that it did.
         # Cleared on each successful ``save_sweep_issues`` call.
         self.last_error: dict | None = None
+        # 2026-08-22 — the agent (``claude -p``) failure pair, so the janitor
+        # BIT can surface a quota / auth outage. Same shape and same shared
+        # arithmetic as curator's: {"ts", "kind", "summary_tail", "consecutive",
+        # "since"}, ``None`` until the first agent failure.
+        self.last_agent_failure: dict | None = None
+        # And a DEDICATED success timestamp, deliberately not reusing any sweep
+        # timestamp. ``sweeps[*].timestamp`` and ``last_deep_sweep`` are stamped
+        # whether or not the agent call inside the sweep succeeded — ``add_sweep``
+        # runs unconditionally at the end of ``run_sweep``, right past the
+        # ``sweep.agent_failed`` log. Feeding one of those to the recovery
+        # predicate would mark every agent failure "superseded by a success"
+        # on the very next sweep, which is exactly the self-certifying-recovery
+        # bug curator's ``bump_last_run=False`` exists to prevent. Empty string
+        # = the agent has never succeeded here, which the predicate reads as
+        # "cannot prove recovery" (fails toward ACTIVE — the safe direction).
+        self.last_agent_success: str = ""
 
     def load(self) -> None:
         """Load state from disk if it exists."""
@@ -95,6 +118,17 @@ class JanitorState:
         # the probe-side _read_last_error helper.
         last_error_raw = raw.get("last_error")
         self.last_error = last_error_raw if isinstance(last_error_raw, dict) else None
+        # Schema tolerance: state files written before 2026-08-22 carry neither
+        # agent field. A malformed value degrades to the empty default rather
+        # than crashing the loader OR poisoning the probe.
+        agent_failure_raw = raw.get("last_agent_failure")
+        self.last_agent_failure = (
+            agent_failure_raw if isinstance(agent_failure_raw, dict) else None
+        )
+        agent_success_raw = raw.get("last_agent_success")
+        self.last_agent_success = (
+            agent_success_raw if isinstance(agent_success_raw, str) else ""
+        )
         log.info(
             "state.loaded",
             files=len(self.files),
@@ -131,6 +165,8 @@ class JanitorState:
             "previous_sweep_issues": self.previous_sweep_issues,
             "triage_ids_seen": sorted(self.triage_ids_seen),
             "last_error": self.last_error,
+            "last_agent_failure": self.last_agent_failure,
+            "last_agent_success": self.last_agent_success,
         }
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.state_path.with_suffix(".tmp")
@@ -279,3 +315,78 @@ class JanitorState:
             self.save()
         except OSError as e:
             log.warning("janitor.state.record_error_save_failed", error=str(e))
+
+    # --- agent (``claude -p``) health ---------------------------------------
+    # Janitor's half of the cross-tool agent-failure signal (2026-08-22). On
+    # 2026-08-22 the box's weekly quota was exhausted and janitor had logged
+    # 1,029 ``sweep.agent_failed`` lines (measured on the box ~12:00 UTC —
+    # point-in-time operator state) while its BIT reported ``janitor ok``:
+    # the backend already classified every one of them into a ``kind``, and the
+    # daemon logged that kind and dropped it. Nothing persisted it, so no probe
+    # could read it. These two methods are the missing consumer.
+
+    def record_agent_failure(self, kind: str, summary: str) -> None:
+        """Stamp the most recent agent failure and its STREAK.
+
+        Does NOT touch ``last_agent_success`` — that stays the last time an
+        agent call actually returned success, so the BIT probe can compare the
+        two to tell an active outage from a recovered one.
+
+        The streak is the STRUCTURAL outage signal: ``kind`` carries what
+        failed, ``consecutive`` carries how long it has been failing, and only
+        the second separates one bad sweep from the multi-day backend outage
+        that leaves the vault's issues unfixed. Arithmetic is shared with
+        curator and distiller via
+        :func:`~alfred.health.agent_failure.next_failure_record`.
+        """
+        self.last_agent_failure = next_failure_record(
+            prior=self.last_agent_failure,
+            last_success_ts=self.last_agent_success,
+            kind=kind,
+            summary=summary,
+        )
+        if self.last_agent_failure["consecutive"] == SUSTAINED_FAILURE_STREAK:
+            # ILB, and once per outage: logged on the CROSSING (``==``, not
+            # ``>=``) so the log carries the moment the backend went from flaky
+            # to down rather than one line per failure for the rest of a
+            # multi-day outage. The probe re-derives ``sustained`` from the
+            # streak every sweep, so nothing depends on this line being seen —
+            # it exists so "when did fixes stop?" has a greppable timestamp.
+            log.warning(
+                "janitor.agent_failure_sustained",
+                kind=kind or "other",
+                consecutive=self.last_agent_failure["consecutive"],
+                since=self.last_agent_failure["since"],
+                threshold=SUSTAINED_FAILURE_STREAK,
+                summary_tail=(summary or "")[-300:],
+            )
+
+    def record_agent_success(self) -> None:
+        """Stamp a successful agent call, ending any running failure streak.
+
+        Emits the recovery counterpart of ``janitor.agent_failure_sustained``
+        BEFORE moving the timestamp — the order is the whole trick. Once
+        ``last_agent_success`` moves past the failure,
+        :func:`~alfred.health.agent_failure.failure_superseded_by_success`
+        answers True and the outage is no longer active, so this fires exactly
+        once, on the first success that ends it. No "already logged" flag to
+        persist.
+
+        Silent on ordinary successes (nothing was down) and on recovery from a
+        SHORT streak (a hiccup that resolved is not news). Without the pair, the
+        log shows an outage beginning and never ending — which reads identically
+        to an outage that never ended.
+        """
+        failure = self.last_agent_failure
+        if isinstance(failure, dict) and not failure_superseded_by_success(
+            failure.get("ts"), self.last_agent_success
+        ):
+            streak = read_streak(failure)
+            if streak >= SUSTAINED_FAILURE_STREAK:
+                log.info(
+                    "janitor.agent_failure_recovered",
+                    kind=failure.get("kind", "other"),
+                    consecutive=streak,
+                    since=failure.get("since") or failure.get("ts"),
+                )
+        self.last_agent_success = datetime.now(timezone.utc).isoformat()

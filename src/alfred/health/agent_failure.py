@@ -1,9 +1,27 @@
-"""Shared classification + summary for ``claude -p`` agent failures.
+"""Shared vocabulary, arithmetic and BIT probe for ``claude -p`` agent failures.
 
-ONE implementation, consumed by all three CLI backends (curator, janitor,
-distiller) so a failed structuring call produces the SAME diagnostic summary
-and the SAME closed-set failure ``kind`` everywhere — mirror-write invariant,
-no per-tool copies.
+ONE implementation, consumed by all three CLI-backed tools (curator, janitor,
+distiller), across the whole path a failure travels:
+
+  produce   ``classify_agent_failure`` + ``build_failure_summary`` — called by
+            each tool's ``backends/cli.py`` on a nonzero exit.
+  persist   ``next_failure_record`` (+ ``read_streak``) — called by each tool's
+            ``state.py`` to stamp the failure and its streak. ``AgentCallOutcomes``
+            carries a run's outcomes up to the state owner when the call site
+            cannot reach it (distiller).
+  surface   ``agent_failure_check`` — the ``agent-failure-kind`` BIT probe, called
+            by each tool's ``health.py`` with its own two state fields.
+
+Mirror-write invariant, no per-tool copies. **The persist and surface halves
+were curator-only until 2026-08-22.** Until then the three backends all
+classified their failures identically and only curator kept the answer: on that
+morning the box's weekly quota was exhausted and the BIT reported ``curator
+fail`` with a precise, actionable message, ``janitor ok`` and ``distiller ok``
+— through 1,275 dropped classifications between them (janitor 1,029, distiller
+246; measured on the box 2026-08-22 ~12:00 UTC and re-measured unchanged at
+14:44 — curator's own count moved +81 in that window, so treat any absolute
+here as point-in-time and believe the operator over this paragraph). The
+producing half being shared made that gap invisible — every tool looked wired.
 
 Why this exists (2026-07-29 incident): the box's Claude account hit its
 WEEKLY usage limit. Every ``claude -p`` structuring call failed ``exit 1``
@@ -34,7 +52,12 @@ weak, classification returns :data:`OTHER` — never a false-confident
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from alfred.health.types import CheckResult, Status
 
 # --- Closed set of failure kinds -------------------------------------------
 # Callers switch on these; keep the set small and stable. A new kind is a
@@ -65,12 +88,17 @@ KNOWN_FAILURE_KINDS: frozenset[str] = frozenset({QUOTA_LIMITED, AUTH, OTHER})
 # would be a second mechanism saying what the reset already says.
 #
 # HERE rather than in ``curator/health.py`` because it is a CONTRACT between
-# two modules: ``curator.state.record_agent_failure`` logs the crossing and the
-# curator BIT probe maps it to a severity. Two copies would drift into a state
-# file that announces an outage the probe still calls a warning. This module is
-# already where the shared agent-failure vocabulary lives (the closed ``kind``
-# set above), and its charter is all three CLI-backed tools — so janitor and
-# distiller inherit the same threshold if they grow the same counter.
+# two modules: each tool's ``state.record_agent_failure`` logs the crossing and
+# the tool's BIT probe maps it to a severity. Two copies would drift into a
+# state file that announces an outage the probe still calls a warning. This
+# module is already where the shared agent-failure vocabulary lives (the closed
+# ``kind`` set above), and its charter is all three CLI-backed tools.
+#
+# 2026-08-22: janitor and distiller grew the same counter, as anticipated here,
+# and inherited this threshold unchanged. The threshold is deliberately NOT
+# per-tool — three attempts with no success in between means the same thing to
+# each of them, and a per-tool knob would only be a way for the three to
+# disagree about when the shared backend went down.
 SUSTAINED_FAILURE_STREAK = 3
 
 
@@ -221,6 +249,310 @@ def failure_superseded_by_success(
     if fail_dt is None or success_dt is None:
         return False
     return success_dt >= fail_dt
+
+
+# --- The recorded failure, and its streak ----------------------------------
+# ONE implementation of the streak arithmetic, because 2026-08-22 created the
+# second and third writers. Until then curator was the only tool that persisted
+# an agent failure, so ``record_agent_failure`` could hold the reset-vs-extend
+# rule inline; janitor and distiller now record the same thing, and three
+# inline copies is how a state file starts announcing a streak of 1 on the
+# third day of an outage.
+
+
+def read_streak(failure: dict[str, Any] | None) -> int:
+    """How many CONSECUTIVE agent failures a recorded ``failure`` evidences.
+
+    Reads ``consecutive``, written by :func:`next_failure_record`. A record
+    written before the streak amendment carries no such key and evidences
+    exactly ONE failure, so it reads as 1 — that keeps an in-flight outage's
+    count monotonic across a deploy instead of restarting it at 0 (which would
+    silently un-escalate a live one).
+
+    A non-integer / negative value degrades to 1 rather than raising. The
+    streak is an observability signal, not a correctness invariant, and a
+    hand-edited count must not take a BIT run or a daemon's failure path down.
+
+    **The floor of 1 is conservative for one consumer and not the other, and
+    saying otherwise was wrong** (corrected 2026-08-22 at the gate; the earlier
+    wording claimed degrading "can only delay an escalation, never manufacture
+    one", which holds only for the first of these two):
+
+      * as a SEVERITY input (``agent_failure_check``), 1 is the lowest value
+        that still evidences a failure, so a corrupt count can only under-state
+        the outage — it delays escalation, never invents it;
+      * as the EXTEND BASE (``next_failure_record`` does ``read_streak(prior) +
+        1``), a stored ``0`` or negative yields 2 rather than the 1 curator's
+        pre-2026-08-22 inline ``max(prior, 0) + 1`` produced — one step CLOSER
+        to escalation. Measured at both ends; ``0`` and negatives are the only
+        inputs that diverge, and no writer produces either.
+
+    Kept rather than "fixed" because the divergence is in the speak-up
+    direction, which is the house rule for an instrument allowed to be wrong,
+    and because a corrupt count reaching the threshold one failure early is a
+    better failure than one that never reaches it. Pinned in
+    ``tests/health/test_agent_failure_shared.py`` so the claim is checked
+    rather than asserted.
+
+    ``None`` (no failure recorded at all) reads as 0 — a caller distinguishing
+    "never failed" from "failed once" needs that, and no writer ever produces
+    a stored record with ``consecutive == 0``.
+    """
+    if not isinstance(failure, dict):
+        return 0
+    try:
+        streak = int(failure.get("consecutive", 1))
+    except (TypeError, ValueError):
+        return 1
+    return streak if streak >= 1 else 1
+
+
+def is_sustained(streak: int) -> bool:
+    """Is ``streak`` long enough to be an OUTAGE rather than a hiccup?
+
+    One spelling of the comparison, so a probe cannot call an outage a warning
+    while the state file's own escalation log already called it an outage.
+    """
+    return streak >= SUSTAINED_FAILURE_STREAK
+
+
+def next_failure_record(
+    *,
+    prior: dict[str, Any] | None,
+    last_success_ts: str | None,
+    kind: str,
+    summary: str,
+    now_ts: str | None = None,
+) -> dict[str, Any]:
+    """Build the new ``last_agent_failure`` record for a just-failed call.
+
+    Pure — no I/O, no logging, no clock beyond the ``now_ts`` default — so the
+    reset-vs-extend rule is testable directly and identical in all three tools.
+
+    Reset-vs-extend asks the ONE recovery predicate the BIT probe asks
+    (:func:`failure_superseded_by_success`): a success recorded at-or-after the
+    stored failure broke the streak, so this failure starts a fresh one at 1;
+    otherwise it extends. Sharing the predicate is what keeps the counter and
+    the probe's severity from disagreeing about the same state file.
+
+    ``since`` is the FIRST failure of the current streak, carried forward while
+    it runs — the probe's operator-facing copy says "failing since X", and the
+    most-recent ``ts`` would make a three-day outage read as if it had started
+    moments ago. An older record with no ``since`` falls back to its own ``ts``,
+    the earliest failure it can evidence.
+    """
+    now = now_ts or datetime.now(timezone.utc).isoformat()
+
+    streak = 1
+    since = now
+    if isinstance(prior, dict) and not failure_superseded_by_success(
+        prior.get("ts"), last_success_ts
+    ):
+        streak = read_streak(prior) + 1
+        prior_since = prior.get("since") or prior.get("ts")
+        if isinstance(prior_since, str) and prior_since:
+            since = prior_since
+
+    return {
+        "ts": now,
+        "kind": kind or OTHER,
+        "summary_tail": (summary or "")[-300:],
+        "consecutive": streak,
+        "since": since,
+    }
+
+
+# --- Threading an agent outcome back to the tool that owns state -----------
+
+
+@dataclass
+class AgentCallOutcomes:
+    """Ordered log of what a run's agent calls DID, for a caller that is not
+    the one holding the state file.
+
+    Curator does not need this: its daemon holds both the ``BackendResult`` and
+    the ``StateManager`` in one frame. Distiller does — its agent call lives in
+    ``pipeline._call_llm``, four frames below the daemon, behind functions that
+    return a manifest string. Writing the failure from down there would be
+    clobbered by the daemon's own ``state.save()`` at the end of the run, so the
+    outcomes ride UP instead and the state owner applies them.
+
+    ORDERED, and every call recorded, because the streak means "consecutive
+    attempts with no success in between" — a run whose 3rd of 12 stage calls
+    succeeded broke the streak at that point, and collapsing the run to a single
+    verdict would either erase that success or erase the 11 failures.
+    """
+
+    #: ``(success, kind, summary)`` per agent call, in the order they happened.
+    events: list[tuple[bool, str, str]] = field(default_factory=list)
+
+    def record_success(self) -> None:
+        self.events.append((True, "", ""))
+
+    def record_failure(self, kind: str, summary: str) -> None:
+        self.events.append((False, kind or OTHER, summary or ""))
+
+    @property
+    def failures(self) -> int:
+        return sum(1 for ok, _, _ in self.events if not ok)
+
+    @property
+    def successes(self) -> int:
+        return sum(1 for ok, _, _ in self.events if ok)
+
+
+# --- The BIT probe ---------------------------------------------------------
+# ONE severity mapping, three callers. The alternative considered and rejected
+# was registering a single probe at the aggregation layer that reads all three
+# state files: that loses the TOOL attribution the operator needs (which of the
+# three is down, and for how long), has to re-derive each tool's
+# "is this tool configured on this instance" gate, and cannot participate in the
+# per-tool ``Status.worst`` rollup that ``brief.feed_producer.health_feed_items``
+# keys its cards on. So the probe is shared as a FUNCTION and called from each
+# tool's own ``health.py``, where the config gate and the rollup already live.
+
+
+def agent_failure_check(
+    *,
+    failure: dict[str, Any] | None,
+    last_success_ts: str | None,
+    consequence: str,
+    state_path: Path | str,
+) -> CheckResult:
+    """The ``agent-failure-kind`` probe: is a ``claude -p`` failure still active?
+
+    Closes the 2026-07-29 blind spot: the ``claude-cli-auth`` probe reads
+    ``claude auth status`` (login only, zero tokens) and stays GREEN through a
+    weekly-QUOTA outage — logged in the whole time, just out of budget — while
+    every structuring call fails. This probe derives its signal from REAL
+    failing traffic the tool already recorded into its state file, so the
+    zero-token BIT invariant stands.
+
+    Severity:
+      * no ``failure`` recorded                     → OK   ("no recent agent failures")
+      * failure superseded by a later success       → OK   (pipeline recovered)
+      * active, ``kind == auth``                    → FAIL (pipeline is DOWN — mirrors
+                                                       the claude-cli-auth severity)
+      * active and SUSTAINED (streak >= 3)          → FAIL (an outage, not a hiccup)
+      * active, ``kind == quota_limited``           → WARN
+      * active, ``kind == other`` / unknown         → WARN (surface the CLI tail)
+
+    **Why SUSTAINED is a FAIL and not a louder WARN** (2026-08-15). Severity is
+    the health layer's call — the feed producer says so explicitly and refuses
+    to make it — and FAIL is the only lever that reaches the operator: the
+    brief's health card is an FYI-attention glance item at WARN, while
+    ``brief.feed_producer.health_feed_items`` promotes a FAIL to needs-you
+    attention, which is what puts it in the needs-you column and rings the push
+    doorbell. A WARN with more alarming prose changes nothing an operator would
+    notice.
+
+    ``consequence`` is the per-tool half of the card body — what STOPS while
+    this tool's agent is down (curator: mail quarantining; janitor: vault issues
+    going unfixed; distiller: no learn records). It is the sentence that turns a
+    status into an operator decision, and it is the only text in here that
+    legitimately differs per tool, so it is a parameter rather than a branch.
+    **Write it as a complete sentence ending in a period** — it is embedded
+    mid-line ahead of ``Last CLI message:`` in three branches, and each tool
+    passes exactly ONE, so a phrase that only reads correctly after "since X —"
+    will read wrong after "no success in between:".
+
+    Per ``feedback_intentionally_left_blank.md`` the no-failure case emits an
+    explicit OK line so "healthy" is never silent absence.
+    """
+    payload_base: dict[str, Any] = {"state_path": str(state_path)}
+
+    if not isinstance(failure, dict):
+        return CheckResult(
+            name="agent-failure-kind",
+            status=Status.OK,
+            detail="no recent agent failures",
+            data=dict(payload_base),
+        )
+
+    kind = failure.get("kind", OTHER) or OTHER
+    tail = failure.get("summary_tail", "") or ""
+    ts_display = failure.get("ts", "unknown")
+
+    # A success AT-OR-AFTER the recorded failure means the pipeline recovered —
+    # the stale failure is history, not an active outage. (If either timestamp
+    # is unparseable we cannot PROVE recovery, so the shared predicate answers
+    # False and we surface the failure rather than swallow it.)
+    if failure_superseded_by_success(failure.get("ts"), last_success_ts):
+        return CheckResult(
+            name="agent-failure-kind",
+            status=Status.OK,
+            detail=(
+                f"no recent agent failures (last failure {ts_display} "
+                f"predates last success)"
+            ),
+            data={
+                **payload_base,
+                "last_agent_failure": failure,
+                "last_agent_success": last_success_ts,
+            },
+        )
+
+    streak = read_streak(failure)
+    # The streak's FIRST failure, not its most recent — "failing since" has to
+    # mean since, or a multi-day outage reads as minutes old.
+    since_display = failure.get("since") or ts_display
+    sustained = is_sustained(streak)
+
+    payload: dict[str, Any] = {
+        **payload_base,
+        "kind": kind,
+        "ts": ts_display,
+        "summary_tail": tail,
+        "consecutive": streak,
+        "since": since_display,
+        "sustained": sustained,
+    }
+
+    if kind == AUTH:
+        return CheckResult(
+            name="agent-failure-kind",
+            status=Status.FAIL,
+            detail=(
+                f"claude -p auth failure since {since_display} — {consequence} "
+                f"Last CLI message: {tail}"
+            ),
+            data=payload,
+        )
+    if sustained:
+        # The card body an operator reads at 6am: the failure CLASS on the face
+        # (so "quota-limited" is not buried in a tail), the streak, and the
+        # CONSEQUENCE. The CLI tail rides along because that is where the reset
+        # date lives ("resets Aug 20") — the one fact that decides wait vs act.
+        what = "quota-limited" if kind == QUOTA_LIMITED else f"failing ({kind})"
+        return CheckResult(
+            name="agent-failure-kind",
+            status=Status.FAIL,
+            detail=(
+                f"claude -p {what} since {since_display} — {streak} consecutive agent "
+                f"failures, no success in between: {consequence} "
+                f"Last CLI message: {tail}"
+            ),
+            data=payload,
+        )
+    if kind == QUOTA_LIMITED:
+        return CheckResult(
+            name="agent-failure-kind",
+            status=Status.WARN,
+            detail=(
+                f"claude -p quota-limited since {since_display} — {consequence} "
+                f"Last CLI message: {tail}"
+            ),
+            data=payload,
+        )
+    return CheckResult(
+        name="agent-failure-kind",
+        status=Status.WARN,
+        detail=(
+            f"claude -p failing ({kind}) since {since_display}; "
+            f"last CLI message: {tail}"
+        ),
+        data=payload,
+    )
 
 
 def classify_agent_failure(stdout: str | None, stderr: str | None) -> str:

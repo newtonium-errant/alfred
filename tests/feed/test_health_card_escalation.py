@@ -24,12 +24,14 @@ from pathlib import Path
 from typing import Any
 
 from alfred.brief.feed_producer import health_feed_items
+from alfred.curator.health import CURATOR_AGENT_CONSEQUENCE
 from alfred.daily_sync.action_router import (
     FEED_ACTIONS,
     STATUS_ACKED,
     actions_for,
 )
 from alfred.feed import FeedStore
+from alfred.health.agent_failure import agent_failure_check
 from alfred.feed.model import (
     ATTENTION_FYI,
     ATTENTION_NEEDS_YOU,
@@ -38,14 +40,31 @@ from alfred.feed.model import (
     STATE_ACKED,
 )
 
-# The real curator detail the escalated probe emits, so the card body under
-# test is the one an operator would actually read at 6am.
-_OUTAGE_DETAIL = (
-    "claude -p quota-limited since 2026-08-15T00:31:00+00:00 — 4 consecutive agent "
-    "failures, no success in between: email intake is stopped and new mail is being "
-    "quarantined. Last CLI message: Exit code 1: stdout: You've hit your weekly limit "
-    "· resets Aug 20"
-)
+# The real curator detail the escalated probe emits, so the card body under test
+# is the one an operator would actually read at 6am.
+#
+# DERIVED, not transcribed (2026-08-22). It was a hand-copied literal, and when
+# the severity mapping moved into ``alfred.health.agent_failure`` the real detail
+# gained "(the structuring pipeline is DOWN)" while this string did not. Nothing
+# went red — the assertions below test surviving substrings — so the comment
+# above quietly became false and the fixture became a mirror of a detail the
+# probe no longer emits. Calling the probe keeps the two in lockstep by
+# construction: the feed half is about what the feed DOES with a card body, and
+# it should read the body from whatever curator actually produces.
+_OUTAGE_DETAIL = agent_failure_check(
+    failure={
+        "ts": "2026-08-15T04:00:00+00:00",
+        "since": "2026-08-15T00:31:00+00:00",
+        "kind": "quota_limited",
+        "summary_tail": (
+            "Exit code 1: stdout: You've hit your weekly limit · resets Aug 20"
+        ),
+        "consecutive": 4,
+    },
+    last_success_ts="2026-08-01T00:00:00+00:00",
+    consequence=CURATOR_AGENT_CONSEQUENCE,
+    state_path="(fixture)",
+).detail
 
 
 def _write_bit(vault: Path, summary: str, date_str: str = "2026-08-15") -> None:
