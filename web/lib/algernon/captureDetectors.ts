@@ -439,19 +439,35 @@ export function formatOpenQuestionsSection(
  * evidence — a recipe that has silently drifted is worse than none, since it
  * reads as though somebody checked.
  *
+ * TWO DIFFERENT THINGS IN THIS MODULE ARE SPELLED `threads`, and a recipe that
+ * says only "threads" has named one of them. `CaptureState.threads` is the
+ * `CaptureThread[]` the dock renders; `CaptureEarned.threads` is the BOOLEAN
+ * affordance flag. They are listed separately below for that reason — the
+ * first version of this list named the array and silently left the boolean's
+ * four sites standing.
+ *
  * Deleting this detector is now:
  *   1. `detectThreadSplits`, `groupThreads`, `effectiveSplits`, `threadMarkerFor`,
  *      `contentWords`, and the six `CAPTURE_THREAD_*` constants.
  *   2. `threadSplits` from `CaptureAnalysis`; `splits`, `threadCount` and
- *      `threads` from `CaptureState`; the `CaptureThreadSplit` and
- *      `CaptureThread` types.
+ *      `threads` (the `CaptureThread[]`) from `CaptureState`; the
+ *      `CaptureThreadSplit` and `CaptureThread` types.
  *   3. `assertedSplits` + `dismissedSplits` from `CaptureEarned`, from
  *      `CAPTURE_GROUND_STATE`, and from `freshGroundState`.
- *   4. The `one_thought` and `separate_threads` ids from
+ *   4. **The `threads` BOOLEAN and its four sites**: the field on
+ *      `CaptureEarned`, its `threads: false` entry in `CAPTURE_GROUND_STATE`
+ *      (which `freshGroundState` inherits by spread rather than restating),
+ *      the `'threads'` member of `CAPTURE_AFFORDANCES`, and the
+ *      `prev.threads || threadCount > 1` line in `advanceEarned`.
+ *      ONLY THE LAST OF THOSE IS CAUGHT BY THE COMPILER. Follow this recipe
+ *      literally and `tsc` stops you at `advanceEarned`; a `CAPTURE_AFFORDANCES`
+ *      still listing `'threads'` compiles clean and leaves an earned-ledger row
+ *      that can never light.
+ *   5. The `one_thought` and `separate_threads` ids from
  *      `CAPTURE_CORRECTION_IDS`, their `CaptureCorrection` members, and their
  *      two `correctCapture` cases.
- *   5. The `threadCount > 1` clause from the commit gate.
- *   6. **`correctCapture`'s third parameter.** `analysis` is consumed by the
+ *   6. The `threadCount > 1` clause from the commit gate.
+ *   7. **`correctCapture`'s third parameter.** `analysis` is consumed by the
  *      `one_thought` case AND NOTHING ELSE, so removing the thread detector
  *      changes a PUBLIC SIGNATURE every caller of `correctCapture` passes —
  *      the one part of this that is not confined to the thread surface.

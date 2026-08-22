@@ -1308,11 +1308,70 @@ describe('the Q2 removal recipe', () => {
     for (const name of NAMED_BY_RECIPE) {
       expect([name, name in detectors]).toEqual([name, true]);
     }
-    // The recipe says SIX `CAPTURE_THREAD_*` constants. It said five before the
-    // stopword list joined them, which is exactly how a count goes quietly
-    // wrong — so the number is derived here rather than trusted.
+    // The recipe says SIX `CAPTURE_THREAD_*` constants. It said FIVE when there
+    // were already six, from the very first commit, and stayed wrong for two
+    // more — the number was never checked against the module at all.
+    //
+    // That is worse than drift and the difference matters: drift would mean a
+    // hand-written count needs guarding only against LATER change, which would
+    // leave the next one unverified at the moment it is written. Nothing
+    // changed here. So the count is derived from the module rather than
+    // trusted, which is the only form that is right on arrival.
     const threadConstants = Object.keys(detectors).filter((k) => k.startsWith('CAPTURE_THREAD_'));
     expect(threadConstants).toHaveLength(6);
+  });
+
+  it('names every thread-shaped FIELD the module actually has', () => {
+    // THE OTHER DIRECTION, and the one the pin above is structurally blind to.
+    // That pin resolves names the recipe already mentions, so it catches a
+    // construct being REMOVED or RENAMED. But the recipe went stale because a
+    // commit ADDED machinery it never mentioned, and a list can never fail to
+    // resolve a name that is not on it. This sweep runs the other way: it
+    // starts from the MODULE and asks whether the recipe covers each piece.
+    //
+    // Names are QUALIFIED because that is the whole trap. `CaptureState.threads`
+    // (the CaptureThread[]) and `CaptureEarned.threads` (the boolean) are two
+    // different things spelled the same, so an unqualified "threads" in the
+    // list would be satisfied by either and the sweep would pass while half the
+    // surface stayed unnamed — which is exactly what happened.
+    const NAMED = [
+      'CaptureAnalysis.threadSplits',
+      'CaptureState.splits', 'CaptureState.threadCount', 'CaptureState.threads',
+      'CaptureEarned.threads', 'CaptureEarned.assertedSplits', 'CaptureEarned.dismissedSplits',
+      'CAPTURE_AFFORDANCES.threads',
+    ];
+    const THREAD_SHAPED = /thread|split/i;
+
+    const groundKeys = Object.keys(freshGroundState()).filter((k) => THREAD_SHAPED.test(k));
+    const stateKeys = Object.keys(stateOf(DEMO_TYPED)).filter((k) => THREAD_SHAPED.test(k));
+    const analysisKeys = Object.keys(analyzeCapture(DEMO_TYPED)).filter((k) => THREAD_SHAPED.test(k));
+    const affordances = CAPTURE_AFFORDANCES.filter((a) => THREAD_SHAPED.test(a));
+
+    for (const k of groundKeys) {
+      expect([`CaptureEarned.${k}`, NAMED.includes(`CaptureEarned.${k}`)]).toEqual([`CaptureEarned.${k}`, true]);
+    }
+    for (const k of stateKeys) {
+      expect([`CaptureState.${k}`, NAMED.includes(`CaptureState.${k}`)]).toEqual([`CaptureState.${k}`, true]);
+    }
+    for (const k of analysisKeys) {
+      expect([`CaptureAnalysis.${k}`, NAMED.includes(`CaptureAnalysis.${k}`)]).toEqual([`CaptureAnalysis.${k}`, true]);
+    }
+    for (const a of affordances) {
+      expect([`CAPTURE_AFFORDANCES.${a}`, NAMED.includes(`CAPTURE_AFFORDANCES.${a}`)]).toEqual([`CAPTURE_AFFORDANCES.${a}`, true]);
+    }
+
+    // POSITIVE CONTROLS. A pattern that matched nothing would pass every loop
+    // above without asserting anything — the sweep has to be shown capable of
+    // returning a positive on each surface it claims to cover.
+    expect(groundKeys).toEqual(['threads', 'assertedSplits', 'dismissedSplits']);
+    expect(stateKeys).toEqual(['splits', 'threadCount', 'threads']);
+    expect(analysisKeys).toEqual(['threadSplits']);
+    expect(affordances).toEqual(['threads']);
+    // …and nothing in the list is dead weight, which is what would let a name
+    // be quietly retired from the module while the recipe still claimed it.
+    expect(NAMED).toHaveLength(
+      groundKeys.length + stateKeys.length + analysisKeys.length + affordances.length,
+    );
   });
 
   it('does NOT name anything already deleted', () => {
