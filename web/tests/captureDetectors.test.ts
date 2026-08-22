@@ -11,6 +11,7 @@ import {
   CAPTURE_QUESTION_MIN_CHARS,
   CAPTURE_QUESTION_TRIGGER_CONFIDENCE,
   CAPTURE_SEGMENT_MIN_CHARS,
+  CAPTURE_SENTENCE_ABBREVIATIONS,
   CAPTURE_SOURCE_CUES,
   CAPTURE_SOURCE_MIN_CONFIDENCE,
   CAPTURE_THREAD_CONFIDENCE_BASE,
@@ -28,13 +29,16 @@ import {
   detectSource,
   detectThreadSplits,
   effectiveQuestions,
+  effectiveSplits,
   formatOpenQuestionsSection,
+  freshGroundState,
   groupThreads,
-  normalizeQuestionKey,
+  normalizeSegmentKey,
   questionTriggerFor,
   segmentCapture,
   stepCapture,
   threadMarkerFor,
+  type CaptureCorrection,
   type CaptureEarned,
 } from '../lib/algernon/captureDetectors';
 
@@ -81,15 +85,21 @@ const SKETCH_DEMO_SCRIPT = [
 
 const DEMO_TYPED = SKETCH_DEMO_SCRIPT.join('\n');
 
+/** A line that anchors nothing, asks nothing and starts no thread. */
+const UNRELATED_LINE = 'the gate latch needs a new pin';
+
 /** Ground state, as a fresh mutable value (the export is frozen). */
-function ground(): CaptureEarned {
-  return {
-    ...CAPTURE_GROUND_STATE,
-    overrides: {},
-    dismissedQuestions: [],
-    assertedQuestions: [],
-  };
-}
+const ground = (): CaptureEarned => freshGroundState();
+
+/**
+ * The page's own entry point, from a blank screen.
+ *
+ * Thread assertions go through THIS rather than through `analyzeCapture`,
+ * because the number the operator sees is `CaptureState.threadCount` and the
+ * defect this file exists to keep out was a count that disagreed with the dock
+ * beside it. Asserting the intermediate cannot see that.
+ */
+const stateOf = (text: string) => stepCapture(ground(), text);
 
 /** Type the text one character at a time, exactly as the page will. */
 function typeOut(text: string): CaptureEarned {
@@ -109,10 +119,11 @@ const affordancesOf = (e: CaptureEarned) => CAPTURE_AFFORDANCES.filter((a) => e[
 describe('the sketch demo capture', () => {
   it('reproduces the sketch commit bar: 2 threads · 1 source · 1 open question', () => {
     // Read off the sketch's rendered `.cwhere` copy, not computed here.
-    const a = analyzeCapture(DEMO_TYPED);
-    expect(a.threadCount).toBe(2);
-    expect(a.source).not.toBeNull();
-    expect(a.questions).toHaveLength(1);
+    const s = stateOf(DEMO_TYPED);
+    expect(s.threadCount).toBe(2);
+    expect(s.threads).toHaveLength(2);
+    expect(s.analysis.source).not.toBeNull();
+    expect(s.questions).toHaveLength(1);
   });
 
   it('pins the whole analysis, so a silent re-tuning shows up as a diff', () => {
@@ -231,6 +242,46 @@ describe('segmentCapture', () => {
 
   it('treats a single initial as an initial, not a sentence end', () => {
     expect(segmentCapture('J. Smith called about the trailer')).toHaveLength(1);
+  });
+
+  it('does NOT swallow a sentence boundary after a word like "no"', () => {
+    // The abbreviation list's entry criterion, pinned as the PAIR that shows
+    // why it matters. `no.` for *number* is far rarer than "no." the answer,
+    // and the cost of getting it wrong is not a stray segment — it is silence:
+    // the merged segment inherits the FIRST sentence's opening ("did the…"),
+    // so the question after it stops being a question at all.
+    const swallowed = 'did the amendment go on last week. no. should we redo it before the mow';
+    const s = analyzeCapture(swallowed);
+    expect(s.segments).toHaveLength(3);
+    expect(s.questions).toHaveLength(1);
+    expect(s.questions[0].text).toBe('should we redo it before the mow');
+
+    // The control that proves this is about the LIST and not about the
+    // sentence: the same capture with a word that was never in it.
+    const control = analyzeCapture(
+      'did the amendment go on last week. nope. should we redo it before the mow',
+    );
+    expect(control.segments).toHaveLength(3);
+    expect(control.questions).toHaveLength(1);
+
+    // …and the entries that DO belong still suppress their boundary.
+    expect(segmentCapture("i'm reading the NS Dept. of Ag guide")).toHaveLength(1);
+  });
+
+  it('keeps the abbreviation list to words that do not end sentences', () => {
+    // The criterion, asserted rather than left in a docstring. `no`/`min`/`max`
+    // were removed for it; re-adding one reds here and has to be argued.
+    for (const banned of ['no', 'min', 'max']) {
+      expect([banned, CAPTURE_SENTENCE_ABBREVIATIONS.includes(banned)]).toEqual([
+        banned,
+        false,
+      ]);
+    }
+    // Positive control: the list is not simply empty.
+    expect(CAPTURE_SENTENCE_ABBREVIATIONS).toContain('dept');
+    // `eg`/`ie` earn their place — CHECKED, not assumed. The dotted spelling is
+    // already covered by the single-initial rule, but the undotted one is not.
+    expect(segmentCapture('reading the guide eg. the field is wet')).toHaveLength(1);
   });
 
   it('treats a run of terminal marks as one stop', () => {
@@ -540,41 +591,41 @@ describe('detector 4 — thread split', () => {
     );
     expect(a.threadSplits).toHaveLength(1);
     expect(a.threadSplits[0].marker).toBe('also');
-    expect(a.threadCount).toBe(2);
+    expect(a.threadSplits[0].origin).toBe('detected');
   });
 
   it('does NOT split on a marker that CONTINUES the subject', () => {
     // The negative control the whole heuristic turns on. "also" is there, the
     // vocabulary is not new, so it is the operator adding to what they were
     // already saying — which is not a thread.
-    const a = analyzeCapture(`${FIELD_RUN}\nalso the north field ph needs another sample`);
-    expect(a.threadSplits).toEqual([]);
-    expect(a.threadCount).toBe(1);
+    const s = stateOf(`${FIELD_RUN}\nalso the north field ph needs another sample`);
+    expect(s.analysis.threadSplits).toEqual([]);
+    expect(s.threadCount).toBe(1);
+    expect(s.threads).toHaveLength(1);
   });
 
   it('does NOT split on new vocabulary with no marker', () => {
     // Consecutive sentences about one subject routinely share no content words.
     // Overlap alone would report a new thread per sentence.
-    const a = analyzeCapture(
-      `${FIELD_RUN}\nkyle can't do wednesday so the yarmouth run moves to thursday`,
-    );
-    expect(a.threadSplits).toEqual([]);
-    expect(a.threadCount).toBe(1);
+    const s = stateOf(`${FIELD_RUN}\nkyle can't do wednesday so the yarmouth run moves to thursday`);
+    expect(s.analysis.threadSplits).toEqual([]);
+    expect(s.threadCount).toBe(1);
+    expect(s.threads).toHaveLength(1);
   });
 
   it('needs BOTH conditions — proven by flipping each one alone', () => {
     const marker = "also kyle can't do wednesday so the yarmouth run moves to thursday";
     const noMarker = "kyle can't do wednesday so the yarmouth run moves to thursday";
     const markerHighOverlap = 'also the north field ph needs another sample';
-    expect(analyzeCapture(`${FIELD_RUN}\n${marker}`).threadCount).toBe(2);
-    expect(analyzeCapture(`${FIELD_RUN}\n${noMarker}`).threadCount).toBe(1);
-    expect(analyzeCapture(`${FIELD_RUN}\n${markerHighOverlap}`).threadCount).toBe(1);
+    expect(stateOf(`${FIELD_RUN}\n${marker}`).threadCount).toBe(2);
+    expect(stateOf(`${FIELD_RUN}\n${noMarker}`).threadCount).toBe(1);
+    expect(stateOf(`${FIELD_RUN}\n${markerHighOverlap}`).threadCount).toBe(1);
   });
 
   it('never splits at the first segment — there is nothing to shift away from', () => {
-    const a = analyzeCapture('also kyle moved the yarmouth run to thursday');
-    expect(a.threadSplits).toEqual([]);
-    expect(a.threadCount).toBe(1);
+    const s = stateOf('also kyle moved the yarmouth run to thursday');
+    expect(s.analysis.threadSplits).toEqual([]);
+    expect(s.threadCount).toBe(1);
   });
 
   it('needs enough content words for the overlap to mean anything', () => {
@@ -583,7 +634,7 @@ describe('detector 4 — thread split', () => {
     expect(a.threadSplits).toEqual([]);
     // Positive control: the same marker with enough new words does split.
     expect(
-      analyzeCapture(`${FIELD_RUN}\nalso kyle moved the yarmouth trailer`).threadCount,
+      stateOf(`${FIELD_RUN}\nalso kyle moved the yarmouth trailer`).threadCount,
     ).toBe(2);
   });
 
@@ -646,7 +697,6 @@ describe('detector 4 — thread split', () => {
 
   it('one thread is the absence of a guess, not a guess of one', () => {
     const a = analyzeCapture('soil ph came back 5.2 on the north field');
-    expect(a.threadCount).toBe(1);
     expect(a.threadSplits).toEqual([]);
     const threads = groupThreads(a.segments, a.threadSplits, a.source, a.questions);
     expect(threads[0].split).toBeNull();
@@ -665,7 +715,7 @@ describe('detector 5 — commit bar', () => {
     expect(shapeless.words).toBeGreaterThanOrEqual(CAPTURE_EARN_COMMIT_WORDS);
     expect(shapeless.source).toBeNull();
     expect(shapeless.questions).toEqual([]);
-    expect(shapeless.threadCount).toBe(1);
+    expect(shapeless.threadSplits).toEqual([]);
     expect(advanceEarned(ground(), shapeless).commit).toBe(false);
   });
 
@@ -733,10 +783,23 @@ describe('the latch — once earned it STAYS earned', () => {
     expect(affordancesOf(advanceEarned(full, nothing))).toHaveLength(5);
   });
 
-  it('never lets the thread count fall', () => {
-    const two = advanceEarned(ground(), analyzeCapture(DEMO_TYPED));
+  it('latches the thread DOCK but lets the thread TALLY follow the text', () => {
+    // FLIPPED, with the reversed premise recorded rather than the old
+    // assertion deleted. This used to assert that the count never falls, and
+    // that was the defect: the count latched monotonically while the dock was
+    // rebuilt from the live text every pass, so deleting the line that started
+    // the second thread reported "◆ 2 threads" over a dock holding one.
+    //
+    // What the sketch's rule actually protects is the AFFORDANCE — the dock
+    // must not vanish. A tally that follows the operator's own deletion is not
+    // the interface flickering its complexity away; it is the interface
+    // telling the truth about what is on screen.
+    const two = stepCapture(ground(), DEMO_TYPED);
     expect(two.threadCount).toBe(2);
-    expect(advanceEarned(two, analyzeCapture('one short line')).threadCount).toBe(2);
+    const cut = stepCapture(two.earned, SKETCH_DEMO_SCRIPT.slice(0, 4).join('\n'));
+    expect(cut.earned.threads).toBe(true); // the dock stays
+    expect(cut.threadCount).toBe(1); // …reporting what is actually in it
+    expect(cut.threads).toHaveLength(1);
   });
 
   it('RETURNS TO GROUND STATE on a genuinely empty capture', () => {
@@ -763,8 +826,9 @@ describe('the latch — once earned it STAYS earned', () => {
     const corrected = correctCapture(
       advanceEarned(ground(), analyzeCapture(DEMO_TYPED)),
       { id: 'not_a_source' },
+      analyzeCapture(DEMO_TYPED),
     );
-    expect(corrected.overrides.source).toBe(false);
+    expect(corrected.sourceDismissed).toBe(true);
     expect(advanceEarned(corrected, analyzeCapture(''))).toEqual(ground());
   });
 
@@ -781,10 +845,24 @@ describe('the latch — once earned it STAYS earned', () => {
   it('holds through a character-by-character retype of the whole demo', () => {
     // Nothing may go off at ANY prefix once it has come on.
     //
-    // WEAK ON ITS OWN, and said so rather than left to look strong: typing
-    // FORWARD, the raw criteria happen to be monotone on this capture, so this
-    // passes even with the latch removed entirely (measured — mutation M1).
-    // The pin below is the one that catches it.
+    // THIS COMMENT USED TO SAY THIS PIN WAS WEAK — that it passed even with
+    // the latch removed, because typing forward the raw criteria happened to
+    // be monotone. That was measured and true of the ORIGINAL build, and it is
+    // now false, so it is corrected here rather than only in a commit message
+    // nobody reading this line will look up.
+    //
+    // What changed: the thread tally used to latch monotonically inside
+    // `advanceEarned`, which hid the detector's own non-monotonicity from the
+    // affordance flag. Removing that latch (it was the WARN-2 defect) exposed
+    // a real mid-word flicker, and this pin now catches it. Measured, at
+    // character 250 of this capture:
+    //
+    //     "…also kyle ca"   → content after the marker is [kyle, ca] = 2 → SPLIT
+    //     "…also kyle can"  → "can" is a STOPWORD, content = [kyle] = 1 → none
+    //
+    // One keystroke, and the guess evaporates mid-word. That is the sketch's
+    // "the raw criteria momentarily stop holding" happening for real rather
+    // than quoted, and it is what the affordance latch absorbs.
     let earned = ground();
     let high = 0;
     for (let i = 0; i <= DEMO_TYPED.length; i += 1) {
@@ -829,41 +907,89 @@ also kyle can't do wednesday so the yarmouth run moves to thursday`;
     // button would visibly do nothing.
     let earned = advanceEarned(ground(), analyzeCapture(sourceText));
     expect(earned.source).toBe(true);
-    earned = correctCapture(earned, { id: 'not_a_source' });
+    earned = correctCapture(earned, { id: 'not_a_source' }, analyzeCapture(sourceText));
     expect(earned.source).toBe(false);
     earned = advanceEarned(earned, analyzeCapture(`${sourceText} and more`));
     expect(earned.source).toBe(false);
   });
 
   it('“It’s one thought →” collapses the split and survives re-analysis', () => {
-    let earned = advanceEarned(ground(), analyzeCapture(threadText));
-    expect(earned.threadCount).toBe(2);
-    earned = correctCapture(earned, { id: 'one_thought' });
-    expect(earned.threads).toBe(false);
-    expect(earned.threadCount).toBe(1);
-    const after = stepCapture(earned, `${threadText} and monday`);
-    expect(after.earned.threadCount).toBe(1);
+    const before = stepCapture(ground(), threadText);
+    expect(before.threadCount).toBe(2);
+    const earned = correctCapture(before.earned, { id: 'one_thought' }, before.analysis);
+    const after = stepCapture(earned, `${threadText}\n${UNRELATED_LINE}`);
     expect(after.threadCount).toBe(1);
     expect(after.threads).toHaveLength(1);
+    expect(after.splits).toEqual([]);
+    // The DOCK stays earned — the operator collapsed its contents, they did
+    // not un-earn the affordance.
+    expect(after.earned.threads).toBe(true);
+  });
+
+  it('“It’s one thought →” collapses only what is SHOWING, not threads forever', () => {
+    // A blanket "no threads" latch would mean a capture that later moves to a
+    // genuinely new subject could never offer a split again — the correction
+    // silently becomes a permanent setting.
+    const before = stepCapture(ground(), threadText);
+    const earned = correctCapture(before.earned, { id: 'one_thought' }, before.analysis);
+    expect(stepCapture(earned, threadText).threadCount).toBe(1);
+    // …and a NEW topic shift, further down, is still offered.
+    const grown = `${threadText}\nseparately the trailer needs new tires and an inspection`;
+    const after = stepCapture(earned, grown);
+    expect(after.threadCount).toBe(2);
+    expect(after.threads).toHaveLength(2);
+    expect(after.splits[0].marker).toBe('separately');
   });
 
   it('the MISSED-split inverse forces a split the detector did not offer', () => {
     // A loop fed only "you were wrong to fire" learns to fire less and never
     // learns to fire more.
-    const quiet = "soil ph came back 5.2\nkyle moved the yarmouth run to thursday";
-    let earned = advanceEarned(ground(), analyzeCapture(quiet));
-    expect(earned.threads).toBe(false);
-    earned = correctCapture(earned, { id: 'separate_threads' });
-    expect(earned.threads).toBe(true);
-    expect(earned.threadCount).toBe(2);
-    expect(stepCapture(earned, `${quiet} today`).threadCount).toBe(2);
+    const quiet = 'soil ph came back 5.2\nkyle moved the yarmouth run to thursday';
+    const before = stepCapture(ground(), quiet);
+    expect(before.earned.threads).toBe(false);
+    expect(before.threadCount).toBe(1);
+
+    // IT CARRIES THE SEGMENT. "There is a split you missed" is not a complete
+    // instruction — the page cannot place a boundary it was never told the
+    // position of, and guessing one and then attributing the guess to the
+    // operator is worse than not offering the correction at all. Same rule
+    // that keeps `is_a_source` out of the applicable set.
+    const earned = correctCapture(
+      before.earned,
+      { id: 'separate_threads', text: 'kyle moved the yarmouth run to thursday' },
+      before.analysis,
+    );
+    const after = stepCapture(earned, quiet);
+    expect(after.earned.threads).toBe(true);
+    expect(after.threadCount).toBe(2);
+    expect(after.threads).toHaveLength(2);
+    expect(after.threads[1].segments[0].text).toBe('kyle moved the yarmouth run to thursday');
+    expect(after.splits[0].origin).toBe('operator');
+    // Not dressed up as a guess it never made.
+    expect(after.splits[0].marker).toBeNull();
+    // …and it survives typing elsewhere.
+    expect(stepCapture(earned, `${quiet}\n${UNRELATED_LINE}`).threadCount).toBe(2);
+  });
+
+  it('an asserted split whose segment is deleted is dropped, not carried', () => {
+    const quiet = 'soil ph came back 5.2\nkyle moved the yarmouth run to thursday';
+    const before = stepCapture(ground(), quiet);
+    const earned = correctCapture(
+      before.earned,
+      { id: 'separate_threads', text: 'kyle moved the yarmouth run to thursday' },
+      before.analysis,
+    );
+    expect(stepCapture(earned, quiet).threadCount).toBe(2);
+    const cut = stepCapture(earned, 'soil ph came back 5.2');
+    expect(cut.threadCount).toBe(1);
+    expect(cut.threads).toHaveLength(1);
   });
 
   it('a dismissed question stays dismissed while the rest still mark', () => {
     const text = 'do not forget the fall mow\nshould we amend before the mow';
     let earned = advanceEarned(ground(), analyzeCapture(text));
     expect(stepCapture(earned, text).questions).toHaveLength(2);
-    earned = correctCapture(earned, { id: 'not_a_question', text: 'do not forget the fall mow' });
+    earned = correctCapture(earned, { id: 'not_a_question', text: 'do not forget the fall mow' }, analyzeCapture(text));
     const after = stepCapture(earned, text);
     expect(after.questions).toHaveLength(1);
     expect(after.questions[0].text).toBe('should we amend before the mow');
@@ -873,7 +999,7 @@ also kyle can't do wednesday so the yarmouth run moves to thursday`;
     const text = 'soil ph came back 5.2 on the north field\nthe mow date is not settled';
     let earned = advanceEarned(ground(), analyzeCapture(text));
     expect(stepCapture(earned, text).questions).toEqual([]);
-    earned = correctCapture(earned, { id: 'is_a_question', text: 'the mow date is not settled' });
+    earned = correctCapture(earned, { id: 'is_a_question', text: 'the mow date is not settled' }, analyzeCapture(text));
     const after = stepCapture(earned, text);
     expect(after.questions).toHaveLength(1);
     expect(after.questions[0].trigger).toBe('operator');
@@ -886,7 +1012,7 @@ also kyle can't do wednesday so the yarmouth run moves to thursday`;
   it('an asserted question whose line is deleted is dropped, not carried', () => {
     const text = 'soil ph came back 5.2\nthe mow date is not settled';
     let earned = advanceEarned(ground(), analyzeCapture(text));
-    earned = correctCapture(earned, { id: 'is_a_question', text: 'the mow date is not settled' });
+    earned = correctCapture(earned, { id: 'is_a_question', text: 'the mow date is not settled' }, analyzeCapture(text));
     expect(stepCapture(earned, text).questions).toHaveLength(1);
     // The operator deletes that line — which un-asks it, exactly as deleting a
     // detected question does.
@@ -896,19 +1022,19 @@ also kyle can't do wednesday so the yarmouth run moves to thursday`;
   it('the two question corrections cancel each other rather than stacking', () => {
     const text = 'should we amend before the mow';
     let earned = advanceEarned(ground(), analyzeCapture(text));
-    earned = correctCapture(earned, { id: 'not_a_question', text });
+    earned = correctCapture(earned, { id: 'not_a_question', text }, analyzeCapture(text));
     expect(stepCapture(earned, text).questions).toEqual([]);
-    earned = correctCapture(earned, { id: 'is_a_question', text });
+    earned = correctCapture(earned, { id: 'is_a_question', text }, analyzeCapture(text));
     expect(stepCapture(earned, text).questions).toHaveLength(1);
   });
 
   it('keys a question by its text, so edits ELSEWHERE do not revive it', () => {
     const dismissed = 'do not forget the fall mow';
     let earned = advanceEarned(ground(), analyzeCapture(dismissed));
-    earned = correctCapture(earned, { id: 'not_a_question', text: dismissed });
+    earned = correctCapture(earned, { id: 'not_a_question', text: dismissed }, analyzeCapture(dismissed));
     const grown = `${dismissed}\nsoil ph came back 5.2 on the north field`;
     expect(stepCapture(earned, grown).questions).toEqual([]);
-    expect(normalizeQuestionKey('  Do Not   Forget the Fall Mow ')).toBe(dismissed);
+    expect(normalizeSegmentKey('  Do Not   Forget the Fall Mow ')).toBe(dismissed);
   });
 
   it('a correction never un-earns the commit bar', () => {
@@ -917,7 +1043,7 @@ also kyle can't do wednesday so the yarmouth run moves to thursday`;
     const text = `i'm reading the lowbush guide ${Array.from({ length: 20 }, (_, i) => `w${i}`).join(' ')}`;
     let earned = advanceEarned(ground(), analyzeCapture(text));
     expect(earned.commit).toBe(true);
-    earned = correctCapture(earned, { id: 'not_a_source' });
+    earned = correctCapture(earned, { id: 'not_a_source' }, analyzeCapture(text));
     expect(advanceEarned(earned, analyzeCapture(text)).commit).toBe(true);
   });
 
@@ -927,11 +1053,32 @@ also kyle can't do wednesday so the yarmouth run moves to thursday`;
     const short = "i'm reading the lowbush guide";
     let earned = advanceEarned(ground(), analyzeCapture(short));
     expect(earned.commit).toBe(false);
-    earned = correctCapture(earned, { id: 'not_a_source' });
+    earned = correctCapture(earned, { id: 'not_a_source' }, analyzeCapture(short));
     const padded = `${short} ${Array.from({ length: 20 }, (_, i) => `w${i}`).join(' ')}`;
     expect(advanceEarned(earned, analyzeCapture(padded)).commit).toBe(false);
     // Positive control: the SAME padded text without the correction commits.
     expect(advanceEarned(ground(), analyzeCapture(padded)).commit).toBe(true);
+  });
+
+  it('dismissing the last question keeps the INDICATOR but empties the gutter', () => {
+    // `earned.question` latches ON and never falls — deliberate, so the
+    // indicator does not blink away mid-capture. The consequence lane 2 has to
+    // know: that boolean is the indicator's RIGHT TO EXIST, never its count.
+    // Read it as the count and this capture reports "? 1 open" over an empty
+    // gutter.
+    const text = 'should we amend before the mow';
+    const before = stepCapture(ground(), text);
+    expect(before.questions).toHaveLength(1);
+    expect(before.earned.question).toBe(true);
+
+    const earned = correctCapture(
+      before.earned,
+      { id: 'not_a_question', text },
+      before.analysis,
+    );
+    const after = stepCapture(earned, text);
+    expect(after.questions).toEqual([]); // ← what lane 2 must count
+    expect(after.earned.question).toBe(true); // ← what it must NOT count
   });
 
   it('the correction vocabulary covers both directions of every guess', () => {
@@ -947,10 +1094,166 @@ also kyle can't do wednesday so the yarmouth run moves to thursday`;
 });
 
 /* ══════════════════════════════════════════════════════════════════════════
+ * Correction pairs — asserted at BOTH ends, from one table
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+const SPLIT_TEXT = `soil ph came back 5.2 on the north field
+that's down half a point from last august, same sample points
+also kyle can't do wednesday so the yarmouth run moves to thursday`;
+const QUIET_TEXT = 'soil ph came back 5.2\nkyle moved the yarmouth run to thursday';
+const QUESTION_TEXT = 'should we amend before the mow';
+const STATEMENT_TEXT = 'soil ph came back 5.2\nthe mow date is not settled';
+
+/**
+ * WHY THIS IS A TABLE AND NOT FOUR HAND-WRITTEN TESTS.
+ *
+ * The defect this guards was a relation asserted at the direction where it
+ * holds and left unasserted at the direction where it breaks: `one_thought`
+ * had its collection pinned, `separate_threads` had only its tally, and the
+ * disagreement lived in the half nobody wrote an assertion for. Hand-writing
+ * each half is precisely what lets the halves differ — so both ends of both
+ * pairs come out of one row, and a new pair cannot be added half-covered.
+ *
+ * The SOURCE pair is deliberately absent, with its own test below. Membership
+ * here would prove wiring, not fitness: `is_a_source` has no applicable
+ * direction, so its row would have to be special-cased into meaninglessness.
+ */
+const CORRECTION_PAIRS = [
+  {
+    name: 'threads',
+    read: (s: ReturnType<typeof stateOf>) => s.threadCount,
+    deny: { text: SPLIT_TEXT, before: 2, after: 1, correction: { id: 'one_thought' } as CaptureCorrection },
+    affirm: {
+      text: QUIET_TEXT,
+      before: 1,
+      after: 2,
+      correction: {
+        id: 'separate_threads',
+        text: 'kyle moved the yarmouth run to thursday',
+      } as CaptureCorrection,
+    },
+  },
+  {
+    name: 'questions',
+    read: (s: ReturnType<typeof stateOf>) => s.questions.length,
+    deny: {
+      text: QUESTION_TEXT,
+      before: 1,
+      after: 0,
+      correction: { id: 'not_a_question', text: QUESTION_TEXT } as CaptureCorrection,
+    },
+    affirm: {
+      text: STATEMENT_TEXT,
+      before: 0,
+      after: 1,
+      correction: {
+        id: 'is_a_question',
+        text: 'the mow date is not settled',
+      } as CaptureCorrection,
+    },
+  },
+];
+
+describe.each(CORRECTION_PAIRS)('the $name correction pair', (pair) => {
+  it.each([
+    ['deny', pair.deny],
+    ['affirm', pair.affirm],
+  ])('moves the reported value in the %s direction', (_dir, leg) => {
+    const before = stepCapture(ground(), leg.text);
+    expect(pair.read(before)).toBe(leg.before);
+    const earned = correctCapture(before.earned, leg.correction, before.analysis);
+    const after = stepCapture(earned, leg.text);
+    expect(pair.read(after)).toBe(leg.after);
+    // …and survives typing ELSEWHERE rather than being re-earned away. The
+    // suffix is a new line, deliberately: appending to the corrected segment
+    // itself RELEASES the correction (see the self-cleaning test below), so
+    // asserting survival there would assert the opposite of the contract.
+    expect(pair.read(stepCapture(earned, `${leg.text}\n${UNRELATED_LINE}`))).toBe(leg.after);
+  });
+
+  it('is RELEASED when the corrected segment itself is rewritten', () => {
+    // The other half of keying by text, and the half that looks like a bug
+    // until it is stated: a correction is about the words it was made about.
+    // Rewrite them and it is a different sentence, so the detector gets to
+    // guess again. Deleting the segment drops it entirely.
+    const leg = pair.deny;
+    const before = stepCapture(ground(), leg.text);
+    const earned = correctCapture(before.earned, leg.correction, before.analysis);
+    expect(pair.read(stepCapture(earned, leg.text))).toBe(leg.after);
+    expect(pair.read(stepCapture(earned, `${leg.text} and monday`))).toBe(leg.before);
+  });
+});
+
+describe('reported-shape invariant', () => {
+  const EVERY_LATCHABLE: CaptureCorrection[] = [
+    { id: 'not_a_source' },
+    { id: 'one_thought' },
+    { id: 'separate_threads', text: "also kyle can't do wednesday so the yarmouth run moves to thursday" },
+    { id: 'not_a_question', text: 'question — do we amend before the fall mow or after?' },
+    { id: 'is_a_question', text: 'soil ph came back 5.2 on the north field' },
+  ];
+
+  it.each(EVERY_LATCHABLE.map((c) => [c.id, c] as const))(
+    'after %s, the tally still equals the collection',
+    (_id, correction) => {
+      // THE ONE ASSERTION THAT WOULD HAVE CAUGHT THE ORIGINAL DEFECT, and it
+      // is cheap enough to make on every correction rather than on the one
+      // somebody remembered. "◆ N threads" over a dock holding M is a lie
+      // whichever correction produced it.
+      const before = stepCapture(ground(), DEMO_TYPED);
+      expect(before.threadCount).toBe(before.threads.length);
+      const earned = correctCapture(before.earned, correction, before.analysis);
+      const after = stepCapture(earned, DEMO_TYPED);
+      expect(after.threadCount).toBe(after.threads.length);
+      expect(after.splits).toHaveLength(Math.max(0, after.threads.length - 1));
+    },
+  );
+
+  it('holds while the demo is typed one character at a time', () => {
+    let earned = ground();
+    for (let i = 0; i <= DEMO_TYPED.length; i += 1) {
+      const s = stepCapture(earned, DEMO_TYPED.slice(0, i));
+      expect([i, s.threadCount]).toEqual([i, s.threads.length]);
+      earned = s.earned;
+    }
+  });
+
+  it('the SOURCE pair is one-directional on purpose', () => {
+    // The declared exception, with its rationale AT the assertion so the next
+    // reader meets the decision instead of rediscovering the argument.
+    // `is_a_source` is loggable but not applicable: a source TITLE is a
+    // SUBSTRING of a segment, not a segment, so naming one needs a picker that
+    // is not in v1. Every applicable correction can be completed by naming a
+    // segment — that is the rule, and this is the case it excludes.
+    expect(CAPTURE_CORRECTION_IDS).toContain('is_a_source');
+    const applicable = EVERY_LATCHABLE.map((c) => c.id);
+    expect(applicable).not.toContain('is_a_source');
+    // Positive control: its INVERSE is applicable, so this is a statement about
+    // that one direction and not about the source detector being unreachable.
+    expect(applicable).toContain('not_a_source');
+  });
+});
+
+/* ══════════════════════════════════════════════════════════════════════════
  * The seam — the detectors cannot learn where the text came from
  * ══════════════════════════════════════════════════════════════════════════ */
 
 describe('the origin seam', () => {
+  it('TAKES A STRING AND NOTHING ELSE — the claim itself, asserted', () => {
+    // The whole by-construction argument rests on this signature, and nothing
+    // was asserting it. `detectSource` already takes a second `opts`
+    // parameter, so a future editor adding one here would not look out of
+    // place — and the moment `analyzeCapture` can see where text came from,
+    // dictated and typed captures can drift apart with every test still green.
+    expect(analyzeCapture).toHaveLength(1);
+
+    // Arity alone is not enough: an OPTIONAL second parameter keeps
+    // `.length === 1`. So also prove that a second argument changes nothing.
+    const sneak = analyzeCapture as (t: string, o?: unknown) => ReturnType<typeof analyzeCapture>;
+    expect(sneak(DEMO_TYPED, { origin: 'dictation' })).toEqual(analyzeCapture(DEMO_TYPED));
+    expect(sneak(DEMO_TYPED, { origin: 'typed' })).toEqual(sneak(DEMO_TYPED, { origin: 'dictation' }));
+  });
+
   it('is pure — the same string always analyses the same way', () => {
     expect(analyzeCapture(DEMO_TYPED)).toEqual(analyzeCapture(DEMO_TYPED));
   });
@@ -989,7 +1292,7 @@ describe('the origin seam', () => {
     expect(spoken.words).toBe(typed.words);
     expect(spoken.questions).toHaveLength(typed.questions.length);
     expect(spoken.source).not.toBeNull();
-    expect(spoken.threadCount).toBe(typed.threadCount);
+    expect(stateOf(dictated).threadCount).toBe(stateOf(DEMO_TYPED).threadCount);
     expect(affordancesOf(advanceEarned(ground(), spoken))).toEqual(
       affordancesOf(advanceEarned(ground(), typed)),
     );
@@ -1007,13 +1310,13 @@ describe('the origin seam', () => {
     const typed = analyzeCapture(DEMO_TYPED);
     expect(spoken.words).toBe(typed.words);
     expect(spoken.segments).toHaveLength(1);
-    expect(spoken.threadCount).toBe(1);
+    expect(stateOf(unpunctuated).threadCount).toBe(1);
     expect(spoken.questions).toEqual([]);
 
     // …and the remedy, proven: the same unpunctuated utterances, one per line.
     const perLine = analyzeCapture(SKETCH_DEMO_SCRIPT.join('\n').replace(/\?/g, ''));
     expect(perLine.segments).toHaveLength(5);
-    expect(perLine.threadCount).toBe(2);
+    expect(stateOf(SKETCH_DEMO_SCRIPT.join('\n').replace(/\?/g, '')).threadCount).toBe(2);
     expect(perLine.questions).toHaveLength(1); // the "question —" lead still fires
   });
 });
@@ -1028,8 +1331,13 @@ describe('ground state', () => {
     expect(s.analysis.empty).toBe(true);
     expect(affordancesOf(s.earned)).toEqual([]);
     expect(s.questions).toEqual([]);
-    expect(s.threadCount).toBe(1);
     expect(s.threads).toEqual([]);
+    // ZERO, not one. `threadCount` is `threads.length` and an empty screen has
+    // no threads — the old "always ≥ 1" was the second number that let a tally
+    // disagree with its dock. Nothing renders it here: the "◆ N threads"
+    // indicator is gated on `earned.threads`, which is false at ground.
+    expect(s.threadCount).toBe(0);
+    expect(s.earned.threads).toBe(false);
   });
 
   it('the exported ground state is frozen, so no page can edit the blank screen', () => {

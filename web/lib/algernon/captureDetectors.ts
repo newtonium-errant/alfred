@@ -68,15 +68,33 @@ export const CAPTURE_SEGMENT_MIN_CHARS = 4;
  * Without this, "I'm reading the NS Dept. of Ag guide" segments into two, which
  * inflates the segment count (earning `note` a beat early) and — worse — cuts a
  * source cue in half. Deliberately short and boring: an abbreviation list is a
- * heuristic that shows its work, and every entry here is one a capture in this
- * operator's vocabulary actually produces.
+ * heuristic that shows its work.
+ *
+ * THE ENTRY CRITERION, which is narrower than "is an abbreviation": a word
+ * belongs here only if it is NOT also a word that commonly ends a sentence in
+ * its own right. Getting that wrong is not symmetric. Over-splitting produces a
+ * visibly odd extra segment somebody notices; under-splitting MERGES two
+ * sentences, and the merged segment inherits the FIRST one's opening — so every
+ * detector that reads a segment's start goes quiet and a question after the
+ * abbreviation is swallowed in silence. Under-splitting is the direction that
+ * does not speak up, so an ambiguous entry is left OUT.
+ *
+ * `no` / `min` / `max` were removed for exactly that (`no.` for *number* is far
+ * rarer than "no." the answer; `min.`/`max.` are the same shape). Measured:
+ * "did the amendment go on last week. no. should we redo it before the mow"
+ * merged to 2 segments and reported ZERO questions, where "nope." reports one.
+ * `tests/captureDetectors.test.ts` carries that pair as the pin.
+ *
+ * `eg` / `ie` earn their place and were checked rather than assumed: the DOTTED
+ * spellings ("e.g.", "i.e.") are already handled by the single-initial rule
+ * below, but the undotted "eg." reaches this list and needs it.
  *
  * Stored WITHOUT the trailing period; matched case-insensitively.
  */
 export const CAPTURE_SENTENCE_ABBREVIATIONS: readonly string[] = [
   'approx', 'apt', 'assn', 'ave', 'co', 'corp', 'dept', 'dr', 'eg', 'est',
-  'etc', 'fig', 'ft', 'govt', 'ie', 'inc', 'jr', 'lb', 'lbs', 'ltd', 'max',
-  'min', 'mr', 'mrs', 'ms', 'mt', 'no', 'oz', 'pp', 'rd', 'sr', 'st', 'vs',
+  'etc', 'fig', 'ft', 'govt', 'ie', 'inc', 'jr', 'lb', 'lbs', 'ltd',
+  'mr', 'mrs', 'ms', 'mt', 'oz', 'pp', 'rd', 'sr', 'st', 'vs',
   'yd',
 ];
 
@@ -532,16 +550,25 @@ export function contentWords(text: string): string[] {
   return out;
 }
 
-/** One guessed topic shift. */
+/** One topic shift — guessed, or asserted by the operator. */
 export interface CaptureThreadSplit {
   /** Segment index the new thread STARTS at. */
   atIndex: number;
   lineIndex: number;
-  /** The marker that announced it. */
-  marker: string;
+  /**
+   * The marker that announced it — null when the OPERATOR asserted the split,
+   * because then no marker is what found it.
+   */
+  marker: string | null;
   /** Share of content words already seen — the evidence for the guess. */
   overlap: number;
   confidence: number;
+  /**
+   * Who says so. `operator` splits are not guesses and carry no confidence
+   * worth stating; lane 2 must not label one "confidence 1.00 from a topic
+   * shift", because the operator did not guess and there was no shift.
+   */
+  origin: 'detected' | 'operator';
 }
 
 /**
@@ -573,6 +600,7 @@ export function detectThreadSplits(
           overlap,
           confidence:
             CAPTURE_THREAD_CONFIDENCE_BASE + closeness * CAPTURE_THREAD_CONFIDENCE_SPAN,
+          origin: 'detected',
         });
       }
     }
@@ -680,9 +708,16 @@ export interface CaptureAnalysis {
   segmentCount: number;
   source: CaptureSourceAnchor | null;
   questions: CaptureQuestion[];
+  /**
+   * The topic shifts the DETECTOR found, before any correction.
+   *
+   * There is deliberately no `threadCount` beside this. The count belongs to
+   * `CaptureState`, derived from the grouping the page actually renders; a
+   * second count here would be a second place for the same number to be wrong,
+   * which is the defect the note above `CAPTURE_GROUND_STATE` describes,
+   * rebuilt one layer down. Empty means one thread.
+   */
   threadSplits: CaptureThreadSplit[];
-  /** Always ≥ 1. One thread is not a guess; it is the absence of one. */
-  threadCount: number;
 }
 
 /**
@@ -704,7 +739,6 @@ export function analyzeCapture(text: string): CaptureAnalysis {
     source,
     questions,
     threadSplits,
-    threadCount: threadSplits.length + 1,
   };
 }
 
@@ -726,24 +760,53 @@ export function analyzeCapture(text: string): CaptureAnalysis {
 export interface CaptureEarned {
   note: boolean;
   source: boolean;
+  /**
+   * The question AFFORDANCE — the "? N open" indicator's right to exist.
+   *
+   * IT LATCHES AND NEVER FALLS, including when the operator dismisses the only
+   * question there was. That is deliberate (the indicator must not blink away
+   * mid-capture) but it means this boolean is NOT the tally. Lane 2 must drive
+   * the COUNT from `CaptureState.questions.length`, never from this — read this
+   * as the count and a capture whose only question was dismissed reports "? 1
+   * open" over an empty gutter.
+   */
   question: boolean;
+  /** The thread DOCK's right to exist — latches, same as `question`. */
   threads: boolean;
   commit: boolean;
-  /** Highest thread count reached — never falls except to ground or by
-   *  correction. */
-  threadCount: number;
-  /** Operator answers that outrank the detector, in either direction. */
-  overrides: CaptureOverrides;
+  /** The operator said the anchored source was not one. */
+  sourceDismissed: boolean;
+  /** Segments the operator said START a new thread, by normalised text. */
+  assertedSplits: string[];
+  /** Splits the operator collapsed with "It's one thought", by segment text. */
+  dismissedSplits: string[];
   /** Questions the operator said were not questions, by normalised text. */
   dismissedQuestions: string[];
   /** Segments the operator said WERE questions, by normalised text. */
   assertedQuestions: string[];
 }
 
-export interface CaptureOverrides {
-  source?: boolean;
-  threads?: boolean;
-}
+/**
+ * NO `threadCount` LIVES HERE, and that is the fix for a defect this module
+ * shipped with: a latched tally and a live collection disagree.
+ *
+ * The tally used to latch monotonically (`Math.max(prev, current)`) while
+ * `CaptureState.threads` was rebuilt from the live analysis every pass. Two
+ * reachable branches then reported "◆ 2 threads" over a dock holding one — the
+ * operator asserting a split the detector could not place, AND (the branch the
+ * gate did not test) simply DELETING the line that started the second thread.
+ *
+ * The resolution is not to assert the agreement, it is to remove the second
+ * number: `CaptureState.threadCount` is `threads.length`, derived in one place
+ * from one list. What latches is the AFFORDANCE (`threads` above — the dock
+ * stays available once earned, which is what the sketch's rule actually
+ * protects); what moves is the tally, and a tally that follows the operator's
+ * own edits is honest rather than flickering.
+ *
+ * Detected splits need no latch of their own: `detectThreadSplits` is pure, so
+ * unchanged text re-fires identically. A split only changes when the text it
+ * was guessed from changes, and re-guessing on changed text is correct.
+ */
 
 /** The blank screen. A cursor, a timestamp, and nothing else. */
 export const CAPTURE_GROUND_STATE: CaptureEarned = Object.freeze({
@@ -752,18 +815,42 @@ export const CAPTURE_GROUND_STATE: CaptureEarned = Object.freeze({
   question: false,
   threads: false,
   commit: false,
-  threadCount: 1,
-  overrides: Object.freeze({}) as CaptureOverrides,
+  sourceDismissed: false,
+  assertedSplits: Object.freeze([]) as unknown as string[],
+  dismissedSplits: Object.freeze([]) as unknown as string[],
   dismissedQuestions: Object.freeze([]) as unknown as string[],
   assertedQuestions: Object.freeze([]) as unknown as string[],
 });
+
+/**
+ * A fresh, mutable ground state.
+ *
+ * The export above is frozen so no page can edit the blank screen; this is what
+ * anything that needs to HOLD one starts from.
+ */
+export function freshGroundState(): CaptureEarned {
+  return {
+    ...CAPTURE_GROUND_STATE,
+    assertedSplits: [],
+    dismissedSplits: [],
+    dismissedQuestions: [],
+    assertedQuestions: [],
+  };
+}
 
 /** The affordances the page can earn, in the order the earned ledger lists them. */
 export const CAPTURE_AFFORDANCES = ['note', 'source', 'question', 'threads', 'commit'] as const;
 export type CaptureAffordance = (typeof CAPTURE_AFFORDANCES)[number];
 
-/** Key a question by its text, so an override survives edits ELSEWHERE. */
-export function normalizeQuestionKey(text: string): string {
+/**
+ * Key a SEGMENT by its text, so a correction survives edits ELSEWHERE.
+ *
+ * An index would not: correcting line 2 and then typing a new line 1 would move
+ * the correction onto someone else's words. Text keys also self-clean — edit
+ * the corrected segment and the correction stops matching, which is right,
+ * because it is different words now.
+ */
+export function normalizeSegmentKey(text: string): string {
   return text.trim().toLowerCase().replace(/\s+/g, ' ');
 }
 
@@ -780,13 +867,13 @@ export function effectiveQuestions(
 ): CaptureQuestion[] {
   const dismissed = new Set(earned.dismissedQuestions);
   const kept = analysis.questions.filter(
-    (q) => !dismissed.has(normalizeQuestionKey(q.text)),
+    (q) => !dismissed.has(normalizeSegmentKey(q.text)),
   );
-  const already = new Set(kept.map((q) => normalizeQuestionKey(q.text)));
+  const already = new Set(kept.map((q) => normalizeSegmentKey(q.text)));
   const asserted: CaptureQuestion[] = [];
   for (const key of earned.assertedQuestions) {
     if (already.has(key)) continue;
-    const seg = analysis.segments.find((s) => normalizeQuestionKey(s.text) === key);
+    const seg = analysis.segments.find((s) => normalizeSegmentKey(s.text) === key);
     if (!seg) continue;
     asserted.push({
       text: seg.text,
@@ -800,15 +887,45 @@ export function effectiveQuestions(
   return [...kept, ...asserted].sort((a, b) => a.index - b.index);
 }
 
-/** The thread count after the operator's corrections. */
-export function effectiveThreadCount(
+/**
+ * The splits actually in force: detected, minus the ones the operator
+ * collapsed, plus the ones the operator asserted.
+ *
+ * THE ONE LIST. `CaptureState.threads` is grouped from it and
+ * `CaptureState.threadCount` is its length plus one, so the dock and the
+ * indicator cannot disagree — there is no second number to drift.
+ *
+ * An asserted split whose segment is gone, or which has become the FIRST
+ * segment, is dropped: there is nothing left in front of it to split away from.
+ */
+export function effectiveSplits(
   analysis: CaptureAnalysis,
   earned: CaptureEarned,
-): number {
-  if (earned.overrides.threads === false) return 1;
-  const raw = Math.max(analysis.threadCount, earned.threadCount);
-  if (earned.overrides.threads === true) return Math.max(2, raw);
-  return raw;
+): CaptureThreadSplit[] {
+  const dismissed = new Set(earned.dismissedSplits);
+  const byIndex = new Map<number, CaptureThreadSplit>();
+  for (const split of analysis.threadSplits) {
+    const seg = analysis.segments[split.atIndex];
+    if (seg && dismissed.has(normalizeSegmentKey(seg.text))) continue;
+    byIndex.set(split.atIndex, split);
+  }
+  for (const key of earned.assertedSplits) {
+    if (dismissed.has(key)) continue;
+    const seg = analysis.segments.find((s) => normalizeSegmentKey(s.text) === key);
+    if (!seg || seg.index === 0) continue;
+    if (byIndex.has(seg.index)) continue;
+    byIndex.set(seg.index, {
+      atIndex: seg.index,
+      lineIndex: seg.lineIndex,
+      // The operator asserted it. No marker found it and no shift was measured,
+      // so neither is reported as though it had been.
+      marker: null,
+      overlap: 0,
+      confidence: 1,
+      origin: 'operator',
+    });
+  }
+  return [...byIndex.values()].sort((a, b) => a.atIndex - b.atIndex);
 }
 
 /**
@@ -821,14 +938,15 @@ export function advanceEarned(
   prev: CaptureEarned,
   analysis: CaptureAnalysis,
 ): CaptureEarned {
-  if (analysis.empty) return { ...CAPTURE_GROUND_STATE, overrides: {}, dismissedQuestions: [], assertedQuestions: [] };
+  if (analysis.empty) return freshGroundState();
 
   const questions = effectiveQuestions(analysis, prev);
-  const threadCount = effectiveThreadCount(analysis, prev);
+  const threadCount = effectiveSplits(analysis, prev).length + 1;
 
-  const source =
-    prev.overrides.source ?? (prev.source || analysis.source !== null);
-  const threads = prev.overrides.threads ?? (prev.threads || threadCount > 1);
+  const source = prev.sourceDismissed
+    ? false
+    : prev.source || analysis.source !== null;
+  const threads = prev.threads || threadCount > 1;
   const question = prev.question || questions.length > 0;
   const note =
     prev.note ||
@@ -850,8 +968,9 @@ export function advanceEarned(
     question,
     threads,
     commit,
-    threadCount,
-    overrides: prev.overrides,
+    sourceDismissed: prev.sourceDismissed,
+    assertedSplits: prev.assertedSplits,
+    dismissedSplits: prev.dismissedSplits,
     dismissedQuestions: prev.dismissedQuestions,
     assertedQuestions: prev.assertedQuestions,
   };
@@ -886,18 +1005,33 @@ export type CaptureCorrectionId = (typeof CAPTURE_CORRECTION_IDS)[number];
 /**
  * A correction the latch can apply.
  *
- * `is_a_source` is loggable but NOT here: naming a source the detector missed
- * needs the operator to say WHICH text is the title, and that picker is not in
- * v1. It is in the vocabulary above so the tap is recorded when v1's panel
- * offers it as feedback-only, and the type below is what stops it being passed
- * here as though it did something.
+ * THE RULE FOR MEMBERSHIP, which used to be applied to one of the two inverse
+ * corrections and not the other: a correction is applicable here iff the
+ * operator can COMPLETE it by naming a segment.
+ *
+ * "There is a split the detector missed" is incomplete on its own — the page
+ * cannot place a thread boundary it was never told the position of, and
+ * guessing one and then attributing the guess to the operator is worse than
+ * not offering it. So `separate_threads` carries the segment that STARTS the
+ * new thread, exactly as the question corrections carry theirs. `one_thought`
+ * needs no text: it collapses whatever is currently shown, which is what the
+ * sketch's dock-level button does.
+ *
+ * `is_a_source` is loggable but NOT applicable, and now for a reason that
+ * generalises rather than a special case: a source TITLE is a substring of a
+ * segment, not a segment, so naming one needs a picker that is not in v1. It
+ * stays in the vocabulary above so the tap is recorded, and this type is what
+ * stops it being passed here as though it did something.
  */
 export type CaptureCorrection =
   | { id: 'not_a_source' }
   | { id: 'one_thought' }
-  | { id: 'separate_threads' }
+  | { id: 'separate_threads'; text: string }
   | { id: 'not_a_question'; text: string }
   | { id: 'is_a_question'; text: string };
+
+const withKey = (list: readonly string[], key: string): string[] =>
+  list.includes(key) ? [...list] : [...list, key];
 
 /**
  * Apply the operator's answer. It outranks the detector AND the latch.
@@ -906,46 +1040,61 @@ export type CaptureCorrection =
  * emptied — and it has to be, because latching would otherwise re-earn the
  * dismissed guess on the very next keystroke and "Not a source →" would be a
  * button that visibly does nothing.
+ *
+ * NOT UNIFORMLY, though, and lane 2 needs to know where: `source` moves back
+ * because a wrongly-anchored source is a false statement about the capture.
+ * `question` and `threads` are affordance flags that only ever latch ON — the
+ * gutter marks and the dock contents move, the indicators' right to exist does
+ * not. Drive counts from `CaptureState`, never from those two booleans.
+ *
+ * Takes the analysis because `one_thought` collapses the splits in force RIGHT
+ * NOW, and only the analysis knows what those are.
  */
 export function correctCapture(
   prev: CaptureEarned,
   correction: CaptureCorrection,
+  analysis: CaptureAnalysis,
 ): CaptureEarned {
   switch (correction.id) {
     case 'not_a_source':
-      return { ...prev, source: false, overrides: { ...prev.overrides, source: false } };
-    case 'one_thought':
+      return { ...prev, source: false, sourceDismissed: true };
+    case 'one_thought': {
+      // Dismiss the splits that are showing, rather than latching a blanket
+      // "no threads" — otherwise a capture that later moves to a genuinely new
+      // subject could never offer a split again.
+      const showing = effectiveSplits(analysis, prev)
+        .map((s) => analysis.segments[s.atIndex])
+        .filter(Boolean)
+        .map((s) => normalizeSegmentKey(s.text));
       return {
         ...prev,
-        threads: false,
-        threadCount: 1,
-        overrides: { ...prev.overrides, threads: false },
+        assertedSplits: prev.assertedSplits.filter((k) => !showing.includes(k)),
+        dismissedSplits: showing.reduce(withKey, [...prev.dismissedSplits]),
       };
-    case 'separate_threads':
+    }
+    case 'separate_threads': {
+      const key = normalizeSegmentKey(correction.text);
       return {
         ...prev,
         threads: true,
-        threadCount: Math.max(2, prev.threadCount),
-        overrides: { ...prev.overrides, threads: true },
+        assertedSplits: withKey(prev.assertedSplits, key),
+        dismissedSplits: prev.dismissedSplits.filter((k) => k !== key),
       };
+    }
     case 'not_a_question': {
-      const key = normalizeQuestionKey(correction.text);
+      const key = normalizeSegmentKey(correction.text);
       return {
         ...prev,
-        dismissedQuestions: prev.dismissedQuestions.includes(key)
-          ? prev.dismissedQuestions
-          : [...prev.dismissedQuestions, key],
+        dismissedQuestions: withKey(prev.dismissedQuestions, key),
         assertedQuestions: prev.assertedQuestions.filter((k) => k !== key),
       };
     }
     case 'is_a_question': {
-      const key = normalizeQuestionKey(correction.text);
+      const key = normalizeSegmentKey(correction.text);
       return {
         ...prev,
         question: true,
-        assertedQuestions: prev.assertedQuestions.includes(key)
-          ? prev.assertedQuestions
-          : [...prev.assertedQuestions, key],
+        assertedQuestions: withKey(prev.assertedQuestions, key),
         dismissedQuestions: prev.dismissedQuestions.filter((k) => k !== key),
       };
     }
@@ -962,7 +1111,13 @@ export interface CaptureState {
   earned: CaptureEarned;
   /** Detected, minus dismissed, plus asserted — what the gutter marks. */
   questions: CaptureQuestion[];
-  /** After corrections. */
+  /** The splits in force, detected and asserted. */
+  splits: CaptureThreadSplit[];
+  /**
+   * ALWAYS `threads.length`. Derived, never stored, so the indicator and the
+   * dock cannot report different numbers — see the note above
+   * `CAPTURE_GROUND_STATE`.
+   */
   threadCount: number;
   threads: CaptureThread[];
 }
@@ -978,14 +1133,21 @@ export function stepCapture(prev: CaptureEarned, text: string): CaptureState {
   const analysis = analyzeCapture(text);
   const earned = advanceEarned(prev, analysis);
   const questions = effectiveQuestions(analysis, earned);
-  const threadCount = effectiveThreadCount(analysis, earned);
-  const splits =
-    earned.overrides.threads === false ? [] : analysis.threadSplits;
+  const splits = effectiveSplits(analysis, earned);
+  const threads = groupThreads(
+    analysis.segments,
+    splits,
+    earned.source ? analysis.source : null,
+    questions,
+  );
   return {
     analysis,
     earned,
     questions,
-    threadCount,
-    threads: groupThreads(analysis.segments, splits, earned.source ? analysis.source : null, questions),
+    splits,
+    // Read off the grouping itself. Not `splits.length + 1`, which is the same
+    // number by a different route and so is a second place to be wrong.
+    threadCount: threads.length,
+    threads,
   };
 }
