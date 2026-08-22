@@ -167,16 +167,38 @@ def cmd_consolidate(config: DistillerConfig, skills_dir: Path) -> None:
         create_session_file,
         read_mutations,
     )
+    from alfred.health.agent_failure import AgentCallOutcomes
+
     from .pipeline import run_consolidation
 
     session_path = create_session_file()
+    # Collected and REPORTED, deliberately not written to the state file. This
+    # is a manual operator invocation that can run while the daemon holds its
+    # own DistillerState in memory for the whole watch loop; a write from here
+    # would be clobbered by the daemon's next ``save()`` — or would clobber it.
+    # The daemon is the single writer of agent health. Printing the tally keeps
+    # a hand-run sweep from being silent about a quota outage
+    # (``feedback_intentionally_left_blank.md``) without inventing a second
+    # writer for the same field.
+    outcomes = AgentCallOutcomes()
     try:
-        modified = asyncio.run(run_consolidation(config, skills_dir, session_path))
+        modified = asyncio.run(
+            run_consolidation(config, skills_dir, session_path, outcomes=outcomes)
+        )
         mutations = read_mutations(session_path)
     finally:
         cleanup_session_file(session_path)
 
     print(f"\n=== Consolidation Complete ===")
+    print(
+        f"Agent calls: {outcomes.successes} ok, {outcomes.failures} failed"
+        + (
+            "  (failures are NOT recorded to agent health from a manual run — "
+            "the daemon owns that field)"
+            if outcomes.failures
+            else ""
+        )
+    )
     print(f"Records modified: {len(mutations.get('files_modified', []))}")
     print(f"Records created: {len(mutations.get('files_created', []))}")
     print(f"Records deleted: {len(mutations.get('files_deleted', []))}")

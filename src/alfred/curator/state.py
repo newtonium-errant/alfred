@@ -11,17 +11,13 @@ from typing import Any
 from alfred.health.agent_failure import (
     SUSTAINED_FAILURE_STREAK,
     failure_superseded_by_success,
+    next_failure_record,
+    read_streak,
 )
 
 from .utils import get_logger
 
 log = get_logger(__name__)
-
-# A ``last_agent_failure`` written before the streak amendment carries no
-# ``consecutive`` key. It records ONE observed failure, so it reads as a streak
-# of exactly 1 — the schema-tolerant default that keeps an in-flight outage's
-# count monotonic across a deploy instead of restarting it at 0.
-_LEGACY_STREAK = 1
 
 
 @dataclass
@@ -133,10 +129,7 @@ class State:
             return
         if failure_superseded_by_success(failure.get("ts"), self.last_run):
             return  # already recovered — this is just another ordinary success
-        try:
-            streak = int(failure.get("consecutive", _LEGACY_STREAK))
-        except (TypeError, ValueError):
-            streak = _LEGACY_STREAK
+        streak = read_streak(failure)
         if streak < SUSTAINED_FAILURE_STREAK:
             return
         log.info(
@@ -164,48 +157,25 @@ class State:
         call is a hiccup; the same banner on the third call in a row is an
         outage with a daily cost.
 
-        Reset-vs-extend asks the ONE recovery predicate the BIT probe asks
-        (:func:`~alfred.health.agent_failure.failure_superseded_by_success`):
-        a success recorded at-or-after the stored failure broke the streak, so
-        this failure starts a fresh one at 1; otherwise it extends. Sharing the
-        predicate is what keeps the counter and the probe's severity from
-        disagreeing about the same state file.
+        The reset-vs-extend rule and the ``since`` carry-forward live in
+        :func:`~alfred.health.agent_failure.next_failure_record` as of
+        2026-08-22, when janitor and distiller grew the same counter. They were
+        inline here while curator was the only writer; three inline copies is
+        how one tool's state file starts announcing a streak of 1 on the third
+        day of the same outage another tool is calling sustained.
 
-        ``since`` is the FIRST failure of the current streak, carried forward
-        while it runs. The probe's operator-facing copy says "failing since X",
-        and before this it passed ``ts`` — the most RECENT failure — which made
-        a three-day outage read as if it had started moments ago.
+        What stays here is curator's own two facts: which timestamp counts as
+        "last success" (``last_run``, kept honest by ``mark_processed``'s
+        ``bump_last_run=False`` failure path) and the log event literal.
         """
-        now = datetime.now(timezone.utc).isoformat()
-        prior = self.last_agent_failure
-
-        streak = 1
-        since = now
-        if isinstance(prior, dict) and not failure_superseded_by_success(
-            prior.get("ts"), self.last_run
-        ):
-            try:
-                prior_streak = int(prior.get("consecutive", _LEGACY_STREAK))
-            except (TypeError, ValueError):
-                # A hand-edited / corrupt count must not crash the daemon's
-                # failure path — the streak is an observability signal, not a
-                # correctness invariant. Fall back to the legacy reading.
-                prior_streak = _LEGACY_STREAK
-            streak = max(prior_streak, 0) + 1
-            # An older record has no ``since``; its own ``ts`` is the earliest
-            # failure we can evidence, so the streak starts there rather than
-            # claiming it began now.
-            prior_since = prior.get("since") or prior.get("ts")
-            if isinstance(prior_since, str) and prior_since:
-                since = prior_since
-
-        self.last_agent_failure = {
-            "ts": now,
-            "kind": kind or "other",
-            "summary_tail": (summary or "")[-300:],
-            "consecutive": streak,
-            "since": since,
-        }
+        self.last_agent_failure = next_failure_record(
+            prior=self.last_agent_failure,
+            last_success_ts=self.last_run,
+            kind=kind,
+            summary=summary,
+        )
+        streak = self.last_agent_failure["consecutive"]
+        since = self.last_agent_failure["since"]
 
         if streak == SUSTAINED_FAILURE_STREAK:
             # ILB, and once per outage: logged on the CROSSING (``==``, not

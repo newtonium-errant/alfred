@@ -2,7 +2,8 @@
 
 Janitor probes are deliberately cheap: vault writability, configured
 sweep directories, state file readability, backend known, Anthropic
-auth, and last-successful-sweep daemon-liveness. The runtime cost of
+auth, last-successful-sweep daemon-liveness, and agent-failure-kind.
+The runtime cost of
 a full janitor sweep is irrelevant to this health check — we're only
 checking that the preconditions to start a sweep are satisfied AND
 that the daemon's loop has actually produced a sweep recently.
@@ -12,6 +13,12 @@ the cross-daemon BIT-probe arc; per
 ``feedback_intentionally_left_blank.md`` silence is ambiguous between
 healthy-quiet and broken — the probe disambiguates by consulting
 the daemon's existing state file.
+
+``agent-failure-kind`` was added 2026-08-22 and answers the question
+``last-successful-sweep`` cannot: the sweep loop can cycle perfectly
+while every agent call inside it fails. It did, for 1,029 logged
+failures, against a green ``janitor ok``. Severity mapping is shared
+with curator and distiller in ``alfred.health.agent_failure``.
 """
 
 from __future__ import annotations
@@ -22,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from alfred.health.agent_failure import agent_failure_check
 from alfred.health.aggregator import register_check
 from alfred.health.anthropic_auth import check_anthropic_auth, resolve_api_key
 from alfred.health.claude_cli_auth import check_claude_cli_auth, resolve_claude_command
@@ -199,6 +207,64 @@ def _read_last_error(state_path: Path) -> dict | None:
     return err
 
 
+#: What stops while janitor's agent backend is down. One sentence, used in
+#: every severity branch of the shared probe. Janitor's failure is quieter than
+#: curator's — nothing is lost and nothing quarantines — so the sentence has to
+#: say what the SILENCE means, or a green-looking vault reads as a clean one.
+JANITOR_AGENT_CONSEQUENCE = (
+    "vault issue fixes are not being applied — the scanner still finds issues, "
+    "nothing is repairing them."
+)
+
+
+def _read_janitor_agent_failure(state_path: Path) -> tuple[dict | None, str]:
+    """Read the ``(last_agent_failure, last_agent_success)`` pair from state.
+
+    Inline dict-walk rather than constructing ``JanitorState`` — matches
+    ``_read_janitor_most_recent_sweep`` and keeps a corrupt state file from
+    crashing the BIT run mid-sweep. A missing/malformed pair degrades to
+    ``(None, "")``, which the probe reads as "nothing has failed".
+    """
+    if not state_path.is_file():
+        return None, ""
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None, ""
+    failure = data.get("last_agent_failure")
+    success = data.get("last_agent_success")
+    return (
+        failure if isinstance(failure, dict) else None,
+        success if isinstance(success, str) else "",
+    )
+
+
+def _check_agent_failure_kind(raw: dict[str, Any]) -> CheckResult:
+    """Janitor's ``agent-failure-kind`` probe.
+
+    Same severity mapping as curator's, from the same function — see
+    :func:`alfred.health.agent_failure.agent_failure_check`. Added 2026-08-22,
+    when janitor was measured logging 1,029 quota-failure lines while its BIT
+    line read ``janitor ok``: the backend had classified every one of those
+    failures, and nothing downstream kept the classification.
+
+    The recovery comparison uses ``last_agent_success``, NOT the sweep
+    timestamps ``_check_last_successful_sweep`` reads. A sweep is recorded
+    whether or not the agent call inside it succeeded, so the two probes answer
+    genuinely different questions: that one asks "is the daemon's loop
+    cycling?" (it was — every 30 minutes, all through the outage), this one asks
+    "is the work inside the loop happening?"
+    """
+    state_path = _resolve_janitor_state_path(raw)
+    failure, last_success = _read_janitor_agent_failure(state_path)
+    return agent_failure_check(
+        failure=failure,
+        last_success_ts=last_success,
+        consequence=JANITOR_AGENT_CONSEQUENCE,
+        state_path=state_path,
+    )
+
+
 def _check_last_successful_sweep(raw: dict[str, Any]) -> CheckResult:
     """Validate that the janitor daemon's loop has produced a sweep
     recently.
@@ -347,6 +413,11 @@ async def health_check(raw: dict[str, Any], mode: str = "quick") -> ToolHealth:
         results.append(await check_claude_cli_auth(command=resolve_claude_command(raw)))
 
     results.append(_check_last_successful_sweep(raw))
+    # Runs unconditionally, NOT gated on ``backend == "claude"`` like the two
+    # auth probes above. Those probe a live credential surface that only the
+    # claude backend has; this one reads a recorded failure, and a failure
+    # recorded before a backend switch is still the last thing that happened.
+    results.append(_check_agent_failure_kind(raw))
 
     status = Status.worst([r.status for r in results])
     return ToolHealth(tool="janitor", status=status, results=results)

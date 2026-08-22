@@ -470,6 +470,23 @@ async def run_sweep(
                             kind=agent_result.kind,
                             summary=agent_result.summary[:500],
                         )
+                        # 2026-08-22 — persist the classified failure so the
+                        # janitor BIT ``agent-failure-kind`` probe can surface a
+                        # quota / auth outage. Before this, ``kind`` was logged
+                        # here and dropped: 1,029 failing sweeps and a green
+                        # ``janitor ok`` on the BIT line. ``state.save()`` at the
+                        # end of the sweep persists it.
+                        state.record_agent_failure(
+                            kind=agent_result.kind,
+                            summary=agent_result.summary,
+                        )
+                    else:
+                        # The success half is what makes the failure signal
+                        # RECOVERABLE. Recorded from the agent call's own
+                        # outcome rather than from the sweep timestamp, which is
+                        # stamped either way — see ``last_agent_success`` in
+                        # ``janitor/state.py``.
+                        state.record_agent_success()
 
     log.info(
         "sweep.complete",

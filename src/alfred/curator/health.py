@@ -5,6 +5,9 @@ Probes:
   * inbox_dir exists (where the curator watches for new files)
   * anthropic auth (via the shared probe in alfred.health.anthropic_auth)
   * backend type is known (static check — warns on misconfigured backends)
+  * agent-failure-kind — whether ``claude -p`` is currently failing.
+    Severity mapping lives in ``alfred.health.agent_failure`` as of
+    2026-08-22; janitor and distiller call the same function.
   * last-successful-process — daemon liveness validation per the
     universal "intentionally left blank" / observability discipline
     (added 2026-05-10 as part of the cross-daemon BIT probe arc;
@@ -25,10 +28,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from alfred.health.agent_failure import (
-    SUSTAINED_FAILURE_STREAK,
-    failure_superseded_by_success,
-)
+from alfred.health.agent_failure import agent_failure_check
 from alfred.health.aggregator import register_check
 from alfred.health.anthropic_auth import check_anthropic_auth, resolve_api_key
 from alfred.health.claude_cli_auth import check_claude_cli_auth, resolve_claude_command
@@ -325,153 +325,43 @@ def _read_curator_last_agent_failure(state_path: Path) -> dict[str, Any] | None:
     return None
 
 
-def _failure_streak(failure: dict[str, Any]) -> int:
-    """How many CONSECUTIVE agent failures the recorded streak stands at.
-
-    Reads ``consecutive``, written by ``curator.state.record_agent_failure``.
-    A record written before the streak amendment has no such key and evidences
-    exactly ONE failure, so it reads as 1 — the same schema-tolerant default
-    the writer uses, and it keeps a pre-deploy outage from being re-read as
-    zero failures (which would silently un-escalate a live one).
-
-    A non-integer / negative value degrades to 1 rather than raising: this is a
-    severity input, and a corrupt count must not take the whole BIT run down
-    mid-sweep. Degrading DOWNWARD is the safe direction — it can only delay an
-    escalation by one more failure, never manufacture one.
-    """
-    try:
-        streak = int(failure.get("consecutive", 1))
-    except (TypeError, ValueError):
-        return 1
-    return streak if streak >= 1 else 1
+#: What stops while curator's agent backend is down. One sentence, used in
+#: every severity branch of the shared probe — see ``agent_failure_check``.
+#: Names the mechanism (structuring is what fails) AND that the mail is
+#: quarantined rather than lost, because "wait for the quota to reset" and
+#: "go dig the mail out" are different operator decisions.
+CURATOR_AGENT_CONSEQUENCE = (
+    "email intake is stopped and new mail is being quarantined "
+    "(the structuring pipeline is DOWN)."
+)
 
 
 def _check_agent_failure_kind(raw: dict[str, Any]) -> CheckResult:
-    """Surface the most recent ``claude -p`` agent failure, if it's still active.
+    """Curator's ``agent-failure-kind`` probe — the shared severity mapping
+    applied to curator's own two state fields.
 
-    Closes the 2026-07-29 blind spot: the ``claude-cli-auth`` probe reads
-    ``claude auth status`` (login only, zero tokens) and stayed GREEN through
-    a three-day WEEKLY-QUOTA outage — logged in the whole time, just out of
-    budget — while every structuring call failed and 234 emails quarantined.
-    This probe derives its signal from REAL failing traffic that curator
-    already recorded into state (no extra ``claude -p`` call — the zero-token
-    BIT invariant stands).
+    The mapping itself lives in
+    :func:`alfred.health.agent_failure.agent_failure_check` (2026-08-22), which
+    janitor and distiller now call with their own state. It used to live here,
+    and while curator was the only tool that recorded an agent failure that was
+    the right place for it. It stopped being the right place the moment a second
+    tool needed the same six-way severity decision.
 
-    Logic:
-      * no ``last_agent_failure`` recorded            → OK  ("no recent agent failures")
-      * failure OLDER-or-equal to the last success    → OK  (pipeline recovered)
-      * active failure, ``kind == auth``              → FAIL (pipeline is DOWN — mirrors
-                                                        the claude-cli-auth severity)
-      * active failure, SUSTAINED (streak >= 3)       → FAIL (an outage, not a hiccup)
-      * active failure, ``kind == quota_limited``     → WARN (intake failing + quarantining)
-      * active failure, ``kind == other`` / unknown   → WARN (surface the CLI tail)
-
-    **Why SUSTAINED is a FAIL and not a louder WARN** (2026-08-15). Severity is
-    the health layer's call — the feed producer says so explicitly and refuses
-    to make it — and FAIL is the only lever here that reaches the operator: the
-    brief's health card is an FYI-attention glance item at WARN, and
-    ``brief.feed_producer.health_feed_items`` promotes a FAIL to needs-you
-    attention, which is what puts it in the needs-you column and rings the push
-    doorbell. So this line is the whole escalation; a WARN with more alarming
-    prose changes nothing an operator would notice, which is exactly what the
-    2026-08-15 outage demonstrated over several days.
-
-    Per ``feedback_intentionally_left_blank.md`` the no-failure case emits an
-    explicit OK line so "healthy" is never silent absence.
+    Curator's "last success" is ``state.last_run``, which is the last
+    SUCCESSFUL process by construction — ``mark_processed`` takes
+    ``bump_last_run=False`` on the failure path precisely so this comparison
+    stays honest. Janitor and distiller could not reuse their equivalents
+    (``sweeps[*].timestamp`` / ``runs[*].timestamp`` are stamped whether or not
+    the agent call succeeded), so they record a dedicated
+    ``last_agent_success``; see the note in their state modules.
     """
     state_path = _resolve_curator_state_path(raw)
     failure = _read_curator_last_agent_failure(state_path)
-
-    if failure is None:
-        return CheckResult(
-            name="agent-failure-kind",
-            status=Status.OK,
-            detail="no recent agent failures",
-            data={"state_path": str(state_path)},
-        )
-
-    last_run_raw = _read_curator_last_run(state_path)
-    kind = failure.get("kind", "other") or "other"
-    tail = failure.get("summary_tail", "") or ""
-    ts_display = failure.get("ts", "unknown")
-
-    # A success AT-OR-AFTER the recorded failure means the pipeline recovered —
-    # the stale failure is history, not an active outage. (If either timestamp
-    # is unparseable we can't PROVE recovery, so the shared predicate answers
-    # False and we surface the failure rather than swallow it.)
-    if failure_superseded_by_success(failure.get("ts"), last_run_raw):
-        return CheckResult(
-            name="agent-failure-kind",
-            status=Status.OK,
-            detail=f"no recent agent failures (last failure {ts_display} predates last success)",
-            data={
-                "state_path": str(state_path),
-                "last_agent_failure": failure,
-                "last_run": last_run_raw,
-            },
-        )
-
-    streak = _failure_streak(failure)
-    # The streak's FIRST failure, not its most recent — "failing since" has to
-    # mean since, or a multi-day outage reads as minutes old. Older records
-    # (pre-streak schema) carry no ``since`` and fall back to ``ts``, which is
-    # the earliest failure they can evidence.
-    since_display = failure.get("since") or ts_display
-    sustained = streak >= SUSTAINED_FAILURE_STREAK
-
-    payload: dict[str, Any] = {
-        "state_path": str(state_path),
-        "kind": kind,
-        "ts": ts_display,
-        "summary_tail": tail,
-        "consecutive": streak,
-        "since": since_display,
-        "sustained": sustained,
-    }
-
-    if kind == "auth":
-        return CheckResult(
-            name="agent-failure-kind",
-            status=Status.FAIL,
-            detail=(
-                f"claude -p auth failure since {since_display} — structuring pipeline is DOWN; "
-                f"last CLI message: {tail}"
-            ),
-            data=payload,
-        )
-    if sustained:
-        # The card body an operator reads at 6am. It names the failure CLASS
-        # (so "quota-limited" is on the face rather than buried in a tail) and
-        # its CONSEQUENCE — email intake is stopped, and the emails are being
-        # quarantined rather than lost. The CLI tail rides along because that
-        # is where the reset date lives ("resets Aug 20"), which is the one
-        # fact that tells the operator whether to wait or to act.
-        what = "quota-limited" if kind == "quota_limited" else f"failing ({kind})"
-        return CheckResult(
-            name="agent-failure-kind",
-            status=Status.FAIL,
-            detail=(
-                f"claude -p {what} since {since_display} — {streak} consecutive agent "
-                f"failures, no success in between: email intake is stopped and new mail "
-                f"is being quarantined. Last CLI message: {tail}"
-            ),
-            data=payload,
-        )
-    if kind == "quota_limited":
-        return CheckResult(
-            name="agent-failure-kind",
-            status=Status.WARN,
-            detail=(
-                f"claude -p quota-limited since {since_display} — intake failing + quarantining; "
-                f"last CLI message: {tail}"
-            ),
-            data=payload,
-        )
-    return CheckResult(
-        name="agent-failure-kind",
-        status=Status.WARN,
-        detail=f"claude -p failing ({kind}) since {since_display}; last CLI message: {tail}",
-        data=payload,
+    return agent_failure_check(
+        failure=failure,
+        last_success_ts=_read_curator_last_run(state_path) if failure else None,
+        consequence=CURATOR_AGENT_CONSEQUENCE,
+        state_path=state_path,
     )
 
 

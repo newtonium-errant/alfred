@@ -10,6 +10,14 @@ from pathlib import Path
 
 import structlog
 
+from alfred.health.agent_failure import (
+    SUSTAINED_FAILURE_STREAK,
+    AgentCallOutcomes,
+    failure_superseded_by_success,
+    next_failure_record,
+    read_streak,
+)
+
 log = structlog.get_logger()
 
 
@@ -93,6 +101,18 @@ class DistillerState:
         # brief.State.add_run, where every successful brief is a
         # per-tick clear because brief.daemon ticks at one cadence.
         self.last_error: dict | None = None
+        # 2026-08-22 — the agent (``claude -p``) failure pair, so the distiller
+        # BIT can surface a quota / auth outage. Same shape and same shared
+        # arithmetic as curator's and janitor's.
+        self.last_agent_failure: dict | None = None
+        # A DEDICATED success timestamp, deliberately not reusing ``runs[*]
+        # .timestamp`` or ``last_deep_extraction``. ``add_run`` fires at the end
+        # of ``run_extraction`` regardless of what the LLM calls inside it did —
+        # indeed ``PipelineResult.success`` is set True unconditionally at the
+        # end of ``run_pipeline``, so a run in which every stage call failed
+        # still records as a run. Feeding either to the recovery predicate would
+        # mark every agent failure "superseded by a success" on the next run.
+        self.last_agent_success: str = ""
 
     def load(self) -> None:
         """Load state from disk if it exists."""
@@ -123,6 +143,17 @@ class DistillerState:
         # the probe-side _read_last_error helper.
         last_error_raw = raw.get("last_error")
         self.last_error = last_error_raw if isinstance(last_error_raw, dict) else None
+        # Schema tolerance: state files written before 2026-08-22 carry neither
+        # agent field. A malformed value degrades to the empty default rather
+        # than crashing the loader OR poisoning the probe.
+        agent_failure_raw = raw.get("last_agent_failure")
+        self.last_agent_failure = (
+            agent_failure_raw if isinstance(agent_failure_raw, dict) else None
+        )
+        agent_success_raw = raw.get("last_agent_success")
+        self.last_agent_success = (
+            agent_success_raw if isinstance(agent_success_raw, str) else ""
+        )
         log.info("state.loaded", files=len(self.files), runs=len(self.runs))
 
     def save(self) -> None:
@@ -151,6 +182,8 @@ class DistillerState:
             "pending_writes": self.pending_writes,
             "last_deep_extraction": self.last_deep_extraction,
             "last_error": self.last_error,
+            "last_agent_failure": self.last_agent_failure,
+            "last_agent_success": self.last_agent_success,
         }
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.state_path.with_suffix(".tmp")
@@ -280,3 +313,78 @@ class DistillerState:
             self.save()
         except OSError as e:
             log.warning("distiller.state.record_error_save_failed", error=str(e))
+
+    # --- agent (``claude -p``) health ---------------------------------------
+    # Distiller's half of the cross-tool agent-failure signal (2026-08-22). On
+    # 2026-08-22 the box's weekly quota was exhausted and distiller had logged
+    # 246 ``pipeline.llm_failed`` lines while its BIT reported ``distiller ok``.
+    # ``_call_llm`` already classified every one of them; nothing persisted it.
+
+    def record_agent_failure(self, kind: str, summary: str) -> None:
+        """Stamp the most recent agent failure and its STREAK.
+
+        See ``janitor.state.JanitorState.record_agent_failure`` — same contract,
+        same shared arithmetic
+        (:func:`~alfred.health.agent_failure.next_failure_record`). Applied from
+        the daemon/CLI once per agent call, in call order, from the
+        :class:`~alfred.health.agent_failure.AgentCallOutcomes` the pipeline
+        carried up.
+        """
+        self.last_agent_failure = next_failure_record(
+            prior=self.last_agent_failure,
+            last_success_ts=self.last_agent_success,
+            kind=kind,
+            summary=summary,
+        )
+        if self.last_agent_failure["consecutive"] == SUSTAINED_FAILURE_STREAK:
+            # ILB, once per outage, on the CROSSING — so "when did extraction
+            # stop?" has a greppable timestamp rather than one line per failure
+            # for the rest of a multi-day outage.
+            log.warning(
+                "distiller.agent_failure_sustained",
+                kind=kind or "other",
+                consecutive=self.last_agent_failure["consecutive"],
+                since=self.last_agent_failure["since"],
+                threshold=SUSTAINED_FAILURE_STREAK,
+                summary_tail=(summary or "")[-300:],
+            )
+
+    def record_agent_success(self) -> None:
+        """Stamp a successful agent call, ending any running failure streak.
+
+        Emits the recovery counterpart BEFORE moving the timestamp, so it fires
+        exactly once on the success that ends an outage — see
+        ``janitor.state.JanitorState.record_agent_success`` for why the order is
+        the whole trick.
+        """
+        failure = self.last_agent_failure
+        if isinstance(failure, dict) and not failure_superseded_by_success(
+            failure.get("ts"), self.last_agent_success
+        ):
+            streak = read_streak(failure)
+            if streak >= SUSTAINED_FAILURE_STREAK:
+                log.info(
+                    "distiller.agent_failure_recovered",
+                    kind=failure.get("kind", "other"),
+                    consecutive=streak,
+                    since=failure.get("since") or failure.get("ts"),
+                )
+        self.last_agent_success = datetime.now(timezone.utc).isoformat()
+
+    def apply_agent_outcomes(self, outcomes: AgentCallOutcomes) -> None:
+        """Fold a run's agent-call outcomes into state, IN ORDER.
+
+        Order matters and is why :class:`AgentCallOutcomes` is a list rather
+        than a tally: a success in the middle of a run breaks the streak at that
+        point, so replaying (fail, fail, success, fail) must leave a streak of
+        1, not 3. Collapsing the run to a single verdict would either erase the
+        success or erase the failures.
+
+        A run with no agent calls at all (nothing qualified for extraction)
+        applies nothing — it is neither evidence of health nor of failure.
+        """
+        for ok, kind, summary in outcomes.events:
+            if ok:
+                self.record_agent_success()
+            else:
+                self.record_agent_failure(kind=kind, summary=summary)

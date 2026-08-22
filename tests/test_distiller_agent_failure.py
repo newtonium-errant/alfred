@@ -20,6 +20,7 @@ from alfred.distiller.backends import BackendResult
 from alfred.distiller.backends.cli import ClaudeBackend
 from alfred.distiller.config import ClaudeBackendConfig, load_from_unified
 from alfred.distiller.pipeline import _call_llm
+from alfred.health.agent_failure import AgentCallOutcomes
 from alfred.vault.mutation_log import cleanup_session_file, create_session_file
 
 INCIDENT_STDOUT = "You've hit your weekly limit · resets 4am (UTC)"
@@ -64,9 +65,12 @@ async def test_pipeline_llm_failed_logs_kind(monkeypatch: pytest.MonkeyPatch, tm
 
     config = load_from_unified({"vault": {"path": str(tmp_path)}})
     session_path = create_session_file()
+    outcomes = AgentCallOutcomes()
     try:
         with structlog.testing.capture_logs() as captured:
-            stdout = await _call_llm("prompt", config, session_path, "s3-test")
+            stdout = await _call_llm(
+                "prompt", config, session_path, "s3-test", outcomes=outcomes
+            )
     finally:
         cleanup_session_file(session_path)
 
@@ -76,3 +80,6 @@ async def test_pipeline_llm_failed_logs_kind(monkeypatch: pytest.MonkeyPatch, tm
     assert len(failed) == 1
     assert failed[0]["kind"] == "quota_limited"
     assert "You've hit your weekly limit" in failed[0]["summary"]
+    # The log line was never the deliverable — the SINK is what reaches state
+    # and therefore the probe. Before 2026-08-22 the kind stopped at the log.
+    assert outcomes.events == [(False, "quota_limited", failed[0]["summary"])]

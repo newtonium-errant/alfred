@@ -35,6 +35,8 @@ from .candidates import (
     group_by_project,
     scan_candidates,
 )
+from alfred.health.agent_failure import AgentCallOutcomes
+
 from .config import DistillerConfig
 from .extractor import extract as v2_extract
 from .parser import parse_file
@@ -360,6 +362,12 @@ async def run_extraction(
     # single-call fallback that used to follow was deleted too).
     session_path = create_session_file()
     any_created = False
+    # 2026-08-22 — one sink per RUN, spanning every batch and Pass B, so a
+    # success in batch 2 correctly breaks a streak that batch 1 started. The
+    # agent call itself lives in ``pipeline._call_llm``, four frames down; it
+    # cannot write state directly because ``state.save()`` below would clobber
+    # the write. Applied to state once, in call order, after the run.
+    agent_outcomes = AgentCallOutcomes()
 
     for batch in batches:
         log.info(
@@ -373,6 +381,7 @@ async def run_extraction(
             batch=batch,
             config=config,
             session_path=session_path,
+            outcomes=agent_outcomes,
         )
 
         result.candidates_processed += pipeline_result.candidates_processed
@@ -435,7 +444,9 @@ async def run_extraction(
     # Pass B: Cross-learning meta-analysis (runs once after all batches)
     if any_created:
         log.info("extraction.passb_start", run_id=run_id)
-        meta_created = await run_meta_analysis(config, session_path)
+        meta_created = await run_meta_analysis(
+            config, session_path, outcomes=agent_outcomes
+        )
         if meta_created > 0:
             result.records_created["meta"] = meta_created
 
@@ -458,6 +469,25 @@ async def run_extraction(
         records_created=sum(result.records_created.values()),
     )
 
+    # Fold the run's agent outcomes into state BEFORE ``save()`` — this is
+    # the write the janitor/curator equivalents do inline at the failure
+    # site, deferred here only because the call site cannot reach state.
+    # ILB: a run that made no agent calls at all says so rather than being
+    # indistinguishable from a run whose recording silently no-opped.
+    if agent_outcomes.events:
+        state.apply_agent_outcomes(agent_outcomes)
+    else:
+        log.info(
+            "extraction.no_agent_calls",
+            run_id=run_id,
+            detail="run made no agent calls; agent health unchanged",
+        )
+    log.info(
+        "extraction.agent_outcomes",
+        run_id=run_id,
+        successes=agent_outcomes.successes,
+        failures=agent_outcomes.failures,
+    )
     state.add_run(result)
     state.save()
     return result
@@ -579,9 +609,13 @@ async def run_watch(
                     read_mutations,
                 )
                 session_path = create_session_file()
+                consolidation_outcomes = AgentCallOutcomes()
                 try:
                     from .pipeline import run_consolidation
-                    modified = await run_consolidation(config, skills_dir, session_path)
+                    modified = await run_consolidation(
+                        config, skills_dir, session_path,
+                        outcomes=consolidation_outcomes,
+                    )
                     log.info("daemon.consolidation_complete", modified=modified)
                     mutations = read_mutations(session_path)
                     total = sum(len(v) for v in mutations.values())
@@ -591,6 +625,22 @@ async def run_watch(
                 except Exception:
                     log.exception("daemon.consolidation_error")
                 finally:
+                    # In ``finally`` deliberately: a consolidation sweep that
+                    # raises mid-way still made real agent calls, and the ones
+                    # that failed are exactly the evidence the probe needs. The
+                    # ``except`` above swallows the exception, so without this
+                    # the outage signal from a crashing sweep would be dropped.
+                    if consolidation_outcomes.events:
+                        state.apply_agent_outcomes(consolidation_outcomes)
+                        state.save()
+                    else:
+                        log.info(
+                            "daemon.consolidation_no_agent_calls",
+                            detail=(
+                                "consolidation made no agent calls; "
+                                "agent health unchanged"
+                            ),
+                        )
                     cleanup_session_file(session_path)
                 last_consolidation = now
                 log.info(
