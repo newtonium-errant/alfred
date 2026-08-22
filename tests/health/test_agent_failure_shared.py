@@ -501,3 +501,101 @@ def test_corrupt_state_file_does_not_crash_the_bit_run(
     raw = {"vault": {"path": str(tmp_path)}, section: {"state": {"path": str(sp)}}}
     r = probe(raw)
     assert r.status is Status.OK
+
+
+# ---------------------------------------------------------------------------
+# KNOWN DEFECT — curator only, pre-existing, NOT fixed by this arc
+# ---------------------------------------------------------------------------
+
+
+def test_curator_last_run_can_be_bumped_without_an_agent_success(
+    tmp_path: Path,
+) -> None:
+    """PINS A BUG, deliberately, so it cannot be lost. Read before "fixing".
+
+    Curator's recovery comparison uses ``state.last_run``, which is honest on
+    the two ``mark_processed`` call sites that matter — the success path, and
+    the legacy failure path that passes ``bump_last_run=False`` precisely to
+    protect this comparison. There is a THIRD call site:
+    ``curator/daemon.py``'s preference-filter branch, ``backend_used=
+    "preference_filter_inbox"``, which retires an inbox file that matched a
+    user filter. No agent call happens on that path, and it takes the default
+    ``bump_last_run=True``.
+
+    So on a quota-limited box, one preference-filtered email arriving during a
+    live outage moves ``last_run`` past the recorded failure. Measured, not
+    reasoned — this test IS the measurement: a sustained FAIL becomes OK, a
+    false ``curator.agent_failure_recovered`` is logged, and the streak resets
+    to 1 so the escalation has to climb from scratch.
+
+    NOT fixed here because the correct fix is the one janitor and distiller
+    already have — a dedicated ``last_agent_success``, split from ``last_run``
+    because the liveness probe (``last-successful-process``) legitimately wants
+    the opposite answer: a preference-filtered file IS evidence the daemon is
+    alive. Splitting the field changes curator's pinned probe contract and
+    deserves its own gate rather than riding this one.
+
+    **If you are reading this because you made it fail: good — delete it.**
+    That means curator grew ``last_agent_success`` and the hole is closed.
+    """
+    from alfred.curator.state import StateManager
+
+    sp = tmp_path / "curator_state.json"
+    mgr = StateManager(sp)
+    raw = {"vault": {"path": str(tmp_path)}, "curator": {"state": {"path": str(sp)}}}
+
+    for _ in range(SUSTAINED_FAILURE_STREAK):
+        mgr.state.record_agent_failure(kind=QUOTA_LIMITED, summary=TAIL)
+    mgr.save()
+    assert curator_probe(raw).status is Status.FAIL, (
+        "precondition: a sustained outage must escalate, or this pin is vacuous"
+    )
+
+    # The preference-filter call site, verbatim. No agent is invoked.
+    mgr.state.mark_processed(
+        filename="filtered.md",
+        inbox_path=str(tmp_path / "filtered.md"),
+        files_created=[],
+        files_modified=[],
+        backend_used="preference_filter_inbox",
+    )
+    mgr.save()
+
+    assert curator_probe(raw).status is Status.OK, (
+        "KNOWN DEFECT (see docstring): the outage is still live; a filtered "
+        "email is not an agent success"
+    )
+    mgr.state.record_agent_failure(kind=QUOTA_LIMITED, summary=TAIL)
+    assert mgr.state.last_agent_failure["consecutive"] == 1, (
+        "KNOWN DEFECT: the streak restarts, so FAIL must be re-earned"
+    )
+
+
+def test_janitor_and_distiller_have_no_such_laundering_path(tmp_path: Path) -> None:
+    """The positive control for the defect pin above, and the reason
+    ``last_agent_success`` is a separate field rather than a reused clock.
+
+    Janitor and distiller stamp agent health ONLY from an agent call's own
+    outcome, so no amount of ordinary bookkeeping can move it. Here the sweep
+    and run clocks are advanced to *now* while the outage stands, and both
+    probes still say FAIL.
+    """
+    from alfred.distiller.state import DistillerState
+    from alfred.janitor.state import JanitorState
+
+    js = JanitorState(tmp_path / "janitor_state.json")
+    ds = DistillerState(tmp_path / "distiller_state.json")
+    for state in (js, ds):
+        for _ in range(SUSTAINED_FAILURE_STREAK):
+            state.record_agent_failure(kind=QUOTA_LIMITED, summary=TAIL)
+    js.last_deep_sweep = _iso(0)
+    ds.last_deep_extraction = _iso(0)
+    js.save()
+    ds.save()
+
+    j_raw = {"vault": {"path": str(tmp_path)},
+             "janitor": {"state": {"path": str(tmp_path / "janitor_state.json")}}}
+    d_raw = {"vault": {"path": str(tmp_path)},
+             "distiller": {"state": {"path": str(tmp_path / "distiller_state.json")}}}
+    assert janitor_probe(j_raw).status is Status.FAIL
+    assert distiller_probe(d_raw).status is Status.FAIL
