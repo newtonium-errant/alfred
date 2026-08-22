@@ -105,6 +105,15 @@ log = structlog.get_logger(__name__)
 # are excluded.
 OPEN_STATUSES: frozenset[str] = frozenset({"todo", "active", "blocked"})
 
+# The "moot" disposition (#103) — closed, but NOT an achievement. Named here
+# because three things in this module now turn on it and a re-localized string
+# comparison is how the health-status ``skip`` miss happened three times in one
+# day. NOT imported from ``tier.task_cancel``: that module is the WRITER, and a
+# reader taking its vocabulary from the writer would make the two agree by
+# construction even if both were wrong about the schema. Both are pinned
+# against ``vault.schema.STATUS_BY_TYPE["task"]``, which is the source.
+CANCELLED_STATUS = "cancelled"
+
 
 def coerce_due_date(value: Any) -> date | None:
     """Coerce a frontmatter ``due`` value to a ``date``.
@@ -2001,15 +2010,32 @@ class TodayView:
 
 def _task_is_done_today(fm: dict, today: date) -> bool:
     """Return True iff a task record counts as completed for the daily
-    goal: status is closed (done/cancelled) AND it was closed today
-    (when a ``completed`` / ``done`` date is present), else just closed.
+    goal: status is ``done`` AND it was closed today (when a ``completed`` /
+    ``done`` date is present), else just done.
 
-    Defensive: a closed task without a completion date still counts
+    Defensive: a done task without a completion date still counts
     (operator marked it done; we can't prove it wasn't today, and
     counting it keeps the goal encouraging rather than pedantic).
+
+    CANCELLED IS NOT DONE (#103), and this docstring used to say it was
+    ("status is closed (done/cancelled)") — with the code agreeing. That was
+    defensible only while nothing wrote ``cancelled`` at runtime: the status was
+    reachable through a conversation with Salem or a one-shot migration, and
+    ``cancelled_at`` is not among the completion-date keys below, so such a task
+    fell through to the unconditional ``return True`` and counted as an
+    achievement. Once the board can cancel in one tap, that is the operator's
+    own complaint — *"I don't want to mark it done"* — implemented as a
+    feature. A cancellation is the ABSENCE of an achievement, not a cheap one.
+
+    Defence in depth rather than the live path: ``compute_today_view`` now drops
+    cancelled task entries from the lanes outright, so a cancelled record should
+    not reach this predicate at all. It is corrected anyway because
+    ``entry_is_done`` is shared with ``day_plan`` and the feed producer, and a
+    predicate that answers "done" for a status nobody completed is a trap for
+    whichever surface reaches it next.
     """
     status = str(fm.get("status") or "todo").lower()
-    if status in OPEN_STATUSES:
+    if status in OPEN_STATUSES or status == CANCELLED_STATUS:
         return False
     # Closed. If a completion date is present, only count today's.
     for key in ("completed", "done", "completed_at", "closed"):
@@ -2138,12 +2164,71 @@ def compute_today_view(
         if c.gap_escalated:
             auto_gap_escalated_t1_keys.add(k)
 
+    # CANCELLED TASKS LEAVE THE PLAN ENTIRELY (#103).
+    #
+    # Every AUTO producer above already drops them for free — each walks the
+    # task dir behind ``status not in OPEN_STATUSES`` (or, for the returned
+    # candidates, ``status != "todo"``), and ``cancelled`` is in neither set. A
+    # CURATED entry is the one shape that does not, because curation is read
+    # from the daily file and is authoritative by design: the operator put it on
+    # today's list, so nothing re-asks the record whether it still wants to be
+    # there.
+    #
+    # That asymmetry was harmless while nothing wrote ``cancelled`` at runtime.
+    # It stops being harmless the moment the board can: MEASURED at
+    # c552fa09 on a curated T1 whose record was cancelled, ``compute_today_view``
+    # reported ``t1_count=1 t1_done=1 all_t1_done=True`` — because
+    # ``_task_is_done_today`` treats every closed status as done, and
+    # ``cancelled_at`` is not one of the completion-date keys it checks. So a
+    # cancellation counted as an ACHIEVEMENT and the brief would have told the
+    # operator he finished his T1. That is the precise falsification the
+    # operator refused when he said *"I don't want to mark it done"* — shipping
+    # the cancel verb without this would have handed his own complaint back to
+    # him in the daily goal.
+    #
+    # Dropping the entry (rather than merely making the predicate answer False)
+    # is the fix, and the alternative is worse: a cancelled task left in the
+    # lane with ``done=False`` renders as an open, actionable card whose ✓ would
+    # flip ``cancelled`` straight to ``done``. Neither a to-do nor an
+    # achievement is what *moot* means, and neither is what it should look like.
+    # ``_task_is_done_today`` is corrected in the same commit as defence in
+    # depth for any future surface that reaches it another way.
+    cancelled_task_names: set[str] = set()
+    task_dir = vault_path / "task"
+    if task_dir.is_dir():
+        import frontmatter as _fm_mod
+
+        for _p in task_dir.glob("*.md"):
+            try:
+                _meta = dict(_fm_mod.load(str(_p)).metadata or {})
+            except Exception:  # noqa: BLE001 — an unreadable record is not a cancel
+                continue
+            if _meta.get("type") != "task":
+                continue
+            if str(_meta.get("status") or "").strip().lower() == CANCELLED_STATUS:
+                cancelled_task_names.add(str(_meta.get("name") or _p.stem).lower())
+    # ILB: a silent drop is indistinguishable from a producer that never ran.
+    if cancelled_task_names:
+        log.info(
+            "tier.today_view.cancelled_tasks_excluded",
+            count=len(cancelled_task_names),
+            names=sorted(cancelled_task_names),
+        )
+
+    def _is_cancelled_task_entry(entry: TierEntry) -> bool:
+        return (
+            entry.origin == "task"
+            and (entry.name or "").strip().lower() in cancelled_task_names
+        )
+
     # 1. Curated entries first (authoritative). Annotate with the auto
     # reason/due when the same item also auto-surfaces (so the render is
     # a pure read of the lane, curated entries included).
     if curation is not None:
         for e in curation.t1:
             entry = _curated_to_tier_entry(e, tier=1)
+            if entry is not None and _is_cancelled_task_entry(entry):
+                continue
             if entry is not None:
                 k = _entry_key(entry, _task_key, _routine_key)
                 if entry.surface_reason is None and k in auto_reason_by_t1_key:
@@ -2164,6 +2249,8 @@ def compute_today_view(
                 t1_keys.add(k)
         for e in curation.t2:
             entry = _curated_to_tier_entry(e, tier=2)
+            if entry is not None and _is_cancelled_task_entry(entry):
+                continue
             if entry is not None:
                 t2.append(entry)
                 t2_keys.add(_entry_key(entry, _task_key, _routine_key))

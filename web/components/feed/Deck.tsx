@@ -15,6 +15,10 @@ import {
   inGestureHoldBand,
   inSnoozeHoldBand,
   snoozeIsBacked,
+  cancelIsServed,
+  CANCEL_ACTION,
+  CANCEL_LABEL,
+  CANCEL_NOTE,
   type SnoozeAction,
   emailPriority,
   kindLabel,
@@ -395,6 +399,19 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
     },
     [deck],
   );
+
+  // Cancel from the ladder (#103). Same one-interaction commit as every other
+  // rung — the pick IS the act, with the deck's usual optimistic toast + Undo
+  // window carrying the way back. It rides `affirmWith` because that is the
+  // deck's generic verb-commit seam (the hold-selector's own path), NOT because
+  // a cancel is an affirmation of anything: the verb on the wire is `cancel`,
+  // and the server routes it to a dispatcher that can reach no completion
+  // writer at all.
+  const onPickCancel = useCallback(() => {
+    setSnoozeMenuOpen(false);
+    gestureConsumedRef.current = false;
+    deck.affirmWith(CANCEL_ACTION);
+  }, [deck]);
 
   // Pick from the hold-selector: ONE INTERACTION — the pick IS the affirm
   // (same optimistic commit, same undo window as the plain gesture; the ruling
@@ -845,7 +862,7 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
                 onClick={closeSnoozeMenu}
                 className={OVERLAY_DISMISS_CLASS}
               >
-                Cancel
+                Close
               </button>
             </div>
             <div className="flex flex-col gap-2">
@@ -865,6 +882,28 @@ export function Deck({ items, onAuthExpired, onSnoozePersist, onUnsnoozePersist 
               It stays off the board until then — unless it gets more urgent than
               it is now.
             </p>
+            {/* The WHETHER rung. Rendered only when the SERVER served the verb
+                (task-origin cards today), under a rule and its own heading so
+                it reads as a different KIND of answer rather than a fifth
+                duration — #14's no-one-control-means-both, applied to a menu. */}
+            {cancelIsServed(current) && (
+              <div className="mt-3 border-t border-console-rule pt-3">
+                <p className={`${OVERLAY_TITLE_CLASS} ${ROLE_TEXT_CLASS.caution} mb-2`}>
+                  Or not at all
+                </p>
+                <button
+                  type="button"
+                  data-testid="deck-cancel-choice"
+                  onClick={onPickCancel}
+                  className={OVERLAY_CHOICE_CLASS}
+                >
+                  {CANCEL_LABEL}
+                </button>
+                <p className="mt-2 text-[11px] italic text-console-ink-faint">
+                  {CANCEL_NOTE}
+                </p>
+              </div>
+            )}
           </div>
         )}
 

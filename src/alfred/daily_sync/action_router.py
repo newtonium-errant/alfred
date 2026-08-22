@@ -198,6 +198,53 @@ from alfred.tier.snooze import (  # noqa: E402
 SNOOZE_ACTED_VERB = "snooze"
 STATUS_ALREADY_DONE = "already_done"
 
+# slot_suggestion CANCEL actions (#103 — the operator's "no quick way to remove
+# a card once assigned without talking to Salem directly" report). The THIRD
+# disposition, and the one the board could not say: ``done`` is *I did it*,
+# ``snooze_*`` is *yes, but later*, ``cancel`` is *never — moot*.
+#
+# DISTINCT FROM BOTH, and the distinction is a ruling rather than a preference:
+# ``feedConstants.ts`` records that "the #14 ruling is explicit that no one
+# control may mean both *not this one* and *yes, but later*", and cancel is a
+# THIRD meaning again — so it gets its own verb rather than overloading either.
+# It reaches a dedicated dispatcher for the same structural reason snooze and
+# sort do: no completion writer is reachable from a cancel under any input, so
+# "a cancel can never fake a done" holds by construction. That guarantee is
+# carried down into ``alfred.tier.task_cancel``, which is a SEPARATE MODULE from
+# ``task_completion`` precisely so the import graph cannot reach ``mark_task_done``.
+#
+# TASK LANE ONLY in v1, per the operator's scope ruling — ``status: cancelled``
+# has a defined meaning on a ``task`` record and nowhere else on this surface.
+# Routine items have no status field (a "cancelled" routine item is a skipped
+# cycle, a different concept), and a free-text T3 entry has no record at all.
+# Enforced twice: ``actions_for_item`` does not OFFER the verbs off the task
+# lane, and ``_dispatch_slot_cancel`` REFUSES them there. Defence in depth,
+# exactly as the ``accept`` candidate-flag gate does it.
+CANCEL_ACTION = "cancel"
+UNDO_CANCEL_ACTION = "undo_cancel"
+CANCEL_ACTIONS: tuple[str, ...] = (CANCEL_ACTION, UNDO_CANCEL_ACTION)
+
+#: The verb stamped on a cancelled item (``acted_action``) — its own word, never
+#: ``DONE_ACTION``. A cancel that stamped ``done`` would make the record's own
+#: audit say the operator finished something he explicitly refused to claim.
+CANCEL_ACTED_VERB = "cancel"
+
+# NO "CLOSED_FAMILY" CONSTANT, and its absence is deliberate — the obvious move
+# here was to define ``(*DONE_FAMILY, CANCEL_ACTED_VERB)`` and widen every
+# ``in DONE_FAMILY`` gate to it, on the reasoning that a cancelled item is as
+# finished as a completed one. That constant was written, and then MEASURED
+# before it was trusted: of the gates that consult ``acted_action``, the ones a
+# cancel could newly reach turn out to be unreachable for ANY verb, because an
+# item in ``STATE_OPEN`` never carries an ``acted_action`` (the store clears it
+# on every non-terminal transition; ``feed.sweep.as_open`` nulls it on revival).
+# Widening them would have added dead branches that READ as coverage — the
+# inert-claim trap, where a name resolves and its effect is nil. The gates that
+# ARE live for cancel take it by its own verb, at the two sites below where the
+# item is genuinely acted (``undo_done``'s guard family and the folded-state
+# carve-out), and they are pinned there.
+STATUS_CANCELLED = "cancelled"  # cancel succeeded → item off the board
+STATUS_UNCANCELLED = "uncancelled"  # undo_cancel succeeded → item back to open
+
 # email_urgent (#27 slice 1) — the classify-time high-priority interrupt kind
 # (curator emits it per-item; distinct from the sync-time email_tier card). It is
 # MODE_DECIDE (deals into the deck + rings/needs-you) but its ONLY action is
@@ -475,6 +522,18 @@ FEED_ACTIONS: dict[str, dict[str, dict[str, Any]]] = {
         **{_verb: {} for _verb in BACKDATE_DONE_ACTIONS},
         "undo_done": {},
         "accept": {},
+        # cancel / undo_cancel (#103): kwargs UNUSED like every other slot verb,
+        # intercepted by :func:`_dispatch_slot_cancel` — a FOURTH dispatcher
+        # beside completion, snooze and sort, for the identical structural
+        # reason those three are separate: no completion, accept, snooze or
+        # sort writer is reachable from a cancel under any input, so "a cancel
+        # never fakes a done" holds by construction rather than by convention.
+        # Both verbs are TASK-LANE ONLY and ``actions_for_item`` withholds them
+        # elsewhere — but they live in the ceiling unconditionally because the
+        # ceiling is the per-KIND capability declaration, and the act-time gate
+        # in the dispatcher is the real door.
+        CANCEL_ACTION: {},
+        UNDO_CANCEL_ACTION: {},
         "snooze_1d": {},
         "snooze_3d": {},
         "snooze_7d": {},
@@ -692,6 +751,37 @@ ACTION_META: dict[str, dict[str, dict[str, Any]]] = {
         "sort_duty": {"label": "Duty", "weight": "light"},
         "sort_rhythm": {"label": "Rhythm", "weight": "light"},
         "sort_fuel": {"label": "Fuel", "weight": "light"},
+        # CANCEL (#103) — the WHETHER answer on the hold ladder, beside the
+        # snooze durations' WHEN answers. Placement is the operator's ruling:
+        # long-press SNOOZE opens the ladder, and the card face stays two
+        # buttons, which keeps cancel away from DONE where a mis-tap would
+        # falsify a completion record.
+        #
+        # DELIBERATELY UNGROUPED, and this is a use of the `group` mechanism
+        # rather than an omission of it. `group` means CO-EQUAL ALTERNATIVES OF
+        # ONE DECISION — the four snooze rungs answer "when?", the four
+        # done rungs answer "done when?". Cancel answers a DIFFERENT question
+        # ("whether at all?"), so grouping it with the durations would encode
+        # the claim that cancel is just another duration, which is precisely
+        # the #14 conflation the ruling forbids. It shares the ladder's real
+        # estate, not its family; the client renders it as its own section.
+        #
+        # HEAVY — the one slot verb that is. It writes a status which removes
+        # the task from every open list, every T1/T2 pool and the returned
+        # sweep in one stroke, and (unlike a sort, which is reversible by
+        # re-sorting) its reversal is only exact where THIS writer stamped the
+        # provenance. The note says what it does, in the operator's own frame.
+        CANCEL_ACTION: {
+            "label": "Cancel it",
+            "weight": "heavy",
+            "note": (
+                "Marks the task cancelled — off every list, record kept and "
+                "struck through. Not the same as done."
+            ),
+        },
+        # LIGHT: the reversal of a heavy verb is not itself heavy, and it is
+        # exact (the cancel recorded the status it came from).
+        UNDO_CANCEL_ACTION: {"label": "Undo cancel", "weight": "light"},
     },
     "email_urgent": {
         "ack": {"label": "Got it", "weight": "light", "gesture": _GESTURE_AFFIRM},
@@ -967,6 +1057,22 @@ def actions_for_item(item: Mapping[str, Any]) -> list[dict[str, Any]]:
             if v.get("verb") not in BACKDATE_DONE_ACTIONS
             or BACKDATE_DONE_ACTIONS[str(v.get("verb"))] <= limit
         ]
+        # CANCEL / UNDO_CANCEL (#103) are served on the TASK LANE ALONE, because
+        # ``status: cancelled`` is a fact about a task RECORD and the other two
+        # lanes have nothing to write it on: a routine item has no status field
+        # (its "cancel" would be a skipped cycle, a different concept the lane
+        # has not ruled on), and a free-text T3 entry has no record at all.
+        # Offering the rung there would be a control that refuses when pressed —
+        # the exact failure this whole serve-side filter exists to remove.
+        #
+        # The discriminator is the producer's OWN stamped ``origin``, matched by
+        # value like the candidate flag above — the same field
+        # :func:`_slot_lane` reads at act time, so what is OFFERED and what is
+        # ADMITTED derive from one fact rather than from two opinions about it.
+        # The act-time gate stays the real door (a stale client still meets it).
+        origin = evidence.get("origin") if isinstance(evidence, Mapping) else None
+        if str(origin or "") != "task":
+            verbs = [v for v in verbs if v.get("verb") not in CANCEL_ACTIONS]
     if kind == SORT_SUGGESTION_KIND:
         # THE PROPOSAL BECOMES THE GESTURE (2026-08-19 ruling). The kind-level
         # table serves the three sort verbs gesture-free — co-equal, no static
@@ -1561,6 +1667,24 @@ def _dispatch_slot_snooze(
     # Family membership, not ``== DONE_ACTION``: an item completed via a
     # backdated rung is exactly as finished as one completed via the plain
     # verb, and parking it would be the same meaningless accept-and-ignore.
+    #
+    # NOT WIDENED TO COVER CANCEL (#103), and the reason is a MEASUREMENT rather
+    # than a judgement about cancel. This dispatcher is reachable only for an
+    # item in ``STATE_OPEN`` (the folded-state gate in ``_act_locked`` answers
+    # ``already_acted`` for every other state, and ``snooze_*`` is not one of its
+    # carve-outs) — and an OPEN item never carries an ``acted_action`` at all:
+    # ``FeedStore._apply_event`` clears the verb on any non-terminal transition,
+    # and ``feed.sweep.as_open`` nulls it explicitly on revival. Both were driven
+    # rather than read.
+    #
+    # So the ``acted_action`` half of the condition below is ALREADY inert, and a
+    # ``CANCEL`` member added to it would have been a second dead branch dressed
+    # as a live defence — the inert-claim trap. The LIVE half is
+    # ``evidence.done``. A cancelled item cannot reach here wearing that flag
+    # either: ``entry_is_done`` now answers False for ``cancelled``, and
+    # ``compute_today_view`` drops the entry before a card is built. The honest
+    # answer for a snooze on a cancelled item is the folded gate's
+    # ``already_acted``, which is what the pin asserts.
     if bool(evidence.get("done")) or getattr(item, "acted_action", None) in DONE_FAMILY:
         log.info(
             "board.snooze.refused_already_done", id=feed_item_id, action=action_id,
@@ -1602,6 +1726,178 @@ def _dispatch_slot_snooze(
         else f"snoozed until {entry.snoozed_until}"
     )
     return ActResult(True, STATUS_ACTED, detail, feed_item_id, action_id)
+
+
+def _dispatch_slot_cancel(
+    feed_item_id: str,
+    action_id: str,
+    item: Any,
+    *,
+    feed_store: Any,
+    config: Any,
+    vault_path: Path | None,
+) -> ActResult:
+    """Apply a board ``cancel`` / ``undo_cancel`` — the WHETHER disposition (#103).
+
+    DELIBERATELY SEPARATE from :func:`_dispatch_slot_completion`,
+    :func:`_dispatch_slot_snooze` and :func:`_dispatch_slot_sort`, and the
+    separation is the same structural argument all three of those make about
+    each other: this function imports no completion writer, no snooze store and
+    no sort writer, so a cancel cannot fake a done, a defer or a slot assignment
+    no matter what evidence arrives. Its ONE import is
+    ``alfred.tier.task_cancel``, which is itself a separate module from
+    ``task_completion`` so that ``mark_task_done`` is not even reachable through
+    this function's import graph.
+
+    TASK LANE ONLY. Every other lane gets an honest ``unsupported_item`` naming
+    what it would have had to write — not a silent accept, and not a generic
+    "can't do that", because a refusal that cannot say its reason reads
+    identically to one firing for an unrelated cause.
+    """
+    from alfred.tier.task_cancel import (
+        TASK_CANCEL_KIND_ALREADY_DONE,
+        TASK_CANCEL_KIND_IDEMPOTENT_NOOP,
+        TASK_CANCEL_KIND_INVALID_STATUS,
+        TASK_CANCEL_KIND_SUCCESS,
+        TASK_RESTORE_KIND_NO_PRIOR_STATUS,
+        TASK_RESTORE_KIND_NOT_CANCELLED,
+        TASK_RESTORE_KIND_SUCCESS,
+        mark_task_cancelled,
+        restore_cancelled_task,
+    )
+
+    evidence = dict(getattr(item, "evidence", None) or {})
+    lane = _slot_lane(evidence)
+
+    if lane != "task":
+        # ILB: name the lane in the log so "why did my cancel do nothing?" is
+        # answerable from the record of the refusal alone.
+        log.info(
+            "feed.act.slot.cancel_unsupported_lane", id=feed_item_id,
+            action=action_id, lane=lane, origin=evidence.get("origin", ""),
+        )
+        return ActResult(
+            False, STATUS_UNSUPPORTED_ITEM,
+            "only task-backed items can be cancelled from the board — "
+            "cancel this one via chat",
+            feed_item_id, action_id,
+        )
+
+    if vault_path is None:
+        return ActResult(
+            False, STATUS_ERROR,
+            "vault not configured — can't record a cancellation",
+            feed_item_id, action_id,
+        )
+
+    rel = str(evidence.get("path") or "").strip()
+    if not rel:
+        log.info(
+            "feed.act.slot.stale_item", id=feed_item_id, action=action_id,
+            reason="no_record_path",
+        )
+        return ActResult(
+            False, STATUS_STALE_ITEM,
+            "task is missing its record path — it'll resurface at the next sync",
+            feed_item_id, action_id,
+        )
+    name = str(evidence.get("item_text") or evidence.get("name") or "").strip()
+
+    if action_id == UNDO_CANCEL_ACTION:
+        # Mirror of the completion dispatcher's undo guards: an item that was
+        # never cancelled has nothing to reverse, and saying so NAMES the state
+        # it is actually in rather than routing it to a writer that would find
+        # nothing and answer ok.
+        if getattr(item, "acted_action", None) not in (None, CANCEL_ACTED_VERB):
+            log.info(
+                "feed.act.slot.undo_cancel_on_other_verb", id=feed_item_id,
+                acted_action=getattr(item, "acted_action", None), action=action_id,
+            )
+            return ActResult(
+                False, STATUS_INVALID_ACTION,
+                "this item isn't cancelled — there's nothing to un-cancel",
+                feed_item_id, action_id,
+            )
+        result = restore_cancelled_task(Path(vault_path), rel)
+        if result.kind == TASK_RESTORE_KIND_SUCCESS:
+            feed_store.set_state(feed_item_id, STATE_OPEN)
+            log.info(
+                "feed.act.slot.uncancelled", id=feed_item_id, lane=lane,
+                kind=result.kind, item=result.name or name,
+                restored_to=result.status,
+            )
+            return ActResult(
+                True, STATUS_UNCANCELLED,
+                f"back on the list: {result.name or name}",
+                feed_item_id, action_id,
+            )
+        log.info(
+            "feed.act.slot.uncancel_refused", id=feed_item_id, lane=lane,
+            kind=result.kind, item=result.name or name,
+        )
+        if result.kind == TASK_RESTORE_KIND_NOT_CANCELLED:
+            return ActResult(
+                False, STATUS_INVALID_ACTION,
+                f"'{result.name or name}' isn't cancelled — nothing to undo",
+                feed_item_id, action_id,
+            )
+        if result.kind == TASK_RESTORE_KIND_NO_PRIOR_STATUS:
+            # The honest dead-end: cancelled by something that recorded no
+            # provenance (Salem, or a migration). Say WHY rather than guessing.
+            return ActResult(
+                False, STATUS_UNSUPPORTED_ITEM,
+                f"'{result.name or name}' was cancelled outside the board, so "
+                "the status it came from wasn't recorded — restore it via chat",
+                feed_item_id, action_id,
+            )
+        return ActResult(
+            False, STATUS_ERROR,
+            f"'{result.name or name}' is no longer a task at that path",
+            feed_item_id, action_id,
+        )
+
+    # THE CANCEL ITSELF.
+    today = _today_for(config)
+    result = mark_task_cancelled(Path(vault_path), rel, today.isoformat())
+    if result.kind in (TASK_CANCEL_KIND_SUCCESS, TASK_CANCEL_KIND_IDEMPOTENT_NOOP):
+        feed_store.set_state(
+            feed_item_id, STATE_ACTED, action=CANCEL_ACTED_VERB,
+        )
+        log.info(
+            "feed.act.slot.cancelled", id=feed_item_id, lane=lane,
+            kind=result.kind, item=result.name or name,
+            date=result.date, prior_status=result.prior_status,
+        )
+        # ILB: say what actually happened, and say the thing the operator asked
+        # for in the words he used — "cancelled", never "done".
+        return ActResult(
+            True, STATUS_CANCELLED,
+            f"cancelled: {result.name or name}",
+            feed_item_id, action_id,
+        )
+    log.info(
+        "feed.act.slot.cancel_refused", id=feed_item_id, lane=lane,
+        kind=result.kind, item=result.name or name, status=result.status,
+    )
+    if result.kind == TASK_CANCEL_KIND_ALREADY_DONE:
+        return ActResult(
+            False, STATUS_ALREADY_DONE,
+            f"'{result.name or name}' is already done — cancelling would erase "
+            "that. Use undo first if it isn't really finished.",
+            feed_item_id, action_id,
+        )
+    if result.kind == TASK_CANCEL_KIND_INVALID_STATUS:
+        return ActResult(
+            False, STATUS_ERROR,
+            f"'{result.name or name}' has an unrecognized status — refusing to "
+            "guess the lifecycle",
+            feed_item_id, action_id,
+        )
+    return ActResult(
+        False, STATUS_ERROR,
+        f"'{result.name or name}' is no longer a task at that path",
+        feed_item_id, action_id,
+    )
 
 
 def _dispatch_slot_completion(
@@ -1690,6 +1986,27 @@ def _dispatch_slot_completion(
                 False, STATUS_INVALID_ACTION,
                 "this item is snoozed, not done — there's nothing to undo "
                 "(use unsnooze to bring it back today)",
+                feed_item_id, action_id,
+            )
+        # THE THIRD MEMBER of that guard family (#103), and it exists for the
+        # identical mechanical reason as the two above: a cancel is stamped
+        # ``state=acted, action=cancel``, so the ``state == STATE_ACTED`` half of
+        # ``is_done`` below reads it as done and would route a merely-cancelled
+        # item to the completion-undo writer. On the task lane that writer
+        # answers ``unsupported`` — the right colour by luck, and only by luck:
+        # it would say "undo isn't available for tasks" to an operator whose
+        # cancel is in fact exactly reversible, sending him to chat for
+        # something the board can do. Name the state and point at the verb that
+        # actually reverses it.
+        if getattr(item, "acted_action", None) == CANCEL_ACTED_VERB:
+            log.info(
+                "feed.act.slot.undo_on_cancelled", id=feed_item_id, lane=lane,
+                action=action_id,
+            )
+            return ActResult(
+                False, STATUS_INVALID_ACTION,
+                "this item is cancelled, not done — there's nothing to undo "
+                "(use undo cancel to put it back)",
                 feed_item_id, action_id,
             )
         # Undo only when the item is CURRENTLY done — freshly board-acted
@@ -3249,7 +3566,26 @@ def _act_locked(
     # at all — its backing record may be closed, renamed or gone. Writing a slot
     # onto that is a guess about something the system has stopped tracking, and
     # the honest refusal below is the better answer.
-    _is_slot_undo = item.kind == SLOT_KIND and action_id == UNDO_DONE_ACTION
+    # ``undo_cancel`` joins ``undo_done`` here (#103) for the identical reason:
+    # a reversal is only ever asked of an item that is ALREADY acted, so a gate
+    # that admits only open items would make the verb unreachable in exactly the
+    # state it exists for.
+    _is_slot_undo = item.kind == SLOT_KIND and action_id in (
+        UNDO_DONE_ACTION, UNDO_CANCEL_ACTION,
+    )
+    # An ACCEPTED item may still be cancelled (#103). Taking something onto
+    # today's plan and later finding it moot is the operator's own reported
+    # sequence, and the accept is not a completion — there is nothing to
+    # falsify by cancelling it. Same carve-out shape, and the same reasoning,
+    # as ``_is_slot_done_on_accepted`` directly below. Deliberately NOT extended
+    # to a cancel-acted or done-acted item: those fold to ``already_acted``,
+    # and the cancel writer's own idempotent/already_done branches are the
+    # honest answer if one ever gets through.
+    _is_slot_cancel_on_accepted = (
+        item.kind == SLOT_KIND
+        and action_id == CANCEL_ACTION
+        and getattr(item, "acted_action", None) == ACCEPT_ACTION
+    )
     # The WHOLE done family, not DONE_ACTION alone: the operator's
     # accept-then-backdate flow ("took it this morning, then remembered he did
     # it yesterday") is exactly a ``done_1d`` on an accept-acted item — a
@@ -3268,6 +3604,7 @@ def _act_locked(
     )
     if item.state != STATE_OPEN and not (
         _is_slot_undo or _is_slot_done_on_accepted or _is_slot_sort
+        or _is_slot_cancel_on_accepted
     ):
         # RETIRED IS NOT ALREADY-ACTED, and the difference is the operator's.
         # A retired card left its producer's open set — the section stopped
@@ -3533,6 +3870,15 @@ def _act_locked(
             return _dispatch_slot_snooze(
                 feed_item_id, action_id, item,
                 feed_store=feed_store, config=config,
+            )
+        if action_id in CANCEL_ACTIONS:
+            # The CANCEL path (#103). Intercepted alongside the snooze and the
+            # sort, before the completion dispatcher, for the same structural
+            # reason: no completion writer is reachable from a cancel under any
+            # input, so a cancel can never fake a done.
+            return _dispatch_slot_cancel(
+                feed_item_id, action_id, item,
+                feed_store=feed_store, config=config, vault_path=vault_path,
             )
         if action_id in SORT_ACTION_BY_SLOT:
             # The SORT path. Intercepted alongside the snooze and before the

@@ -854,6 +854,45 @@ export function snoozeActionFor(item: FeedItem, action: SnoozeAction): string | 
   return snoozeIsBacked(item) ? action : null;
 }
 
+// --- cancel, the WHETHER answer (#103) ---------------------------------------
+// The operator's report: *"There's no quick way to remove a card once assigned
+// without talking to Salem directly ... I don't want to mark it done, but I do
+// want it removed from the list as cancelled."*
+//
+// Placement is the operator's ruling: it is a rung on the SNOOZE hold ladder,
+// beside the durations, and the card face stays two buttons. That keeps it away
+// from DONE — where a mis-tap would falsify a completion record — while putting
+// it exactly where a hand already goes to say "not now".
+//
+// NOT A MEMBER OF THE DURATION FAMILY, and the separation is #14's ruling one
+// step further out. The four snooze rungs are co-equal answers to *when?*;
+// cancel answers *whether at all?*. Rendering it inside the same list would say
+// it is another duration — the very conflation the ruling forbids when it says
+// no one control may mean both "not this one" and "yes, but later". It gets its
+// own section under a rule, sharing the ladder's real estate and not its family.
+export const CANCEL_ACTION = 'cancel';
+export const UNDO_CANCEL_ACTION = 'undo_cancel';
+
+/**
+ * Whether THIS item was served the cancel verb — read from the wire, never from
+ * a client-side kind map.
+ *
+ * The server withholds `cancel` from every lane but task-origin (`status:
+ * cancelled` is a fact about a task RECORD; a routine item has no status field
+ * and a free-text T3 entry has no record at all). So the rung's presence is the
+ * server's answer, and a lane that stops being cancellable stops offering it
+ * with no client change — the 1b-ii lesson, kept: the client renders the
+ * capability, it does not hold an opinion about it.
+ */
+export function cancelIsServed(item: FeedItem): boolean {
+  return servedActions(item).some((a) => a.verb === CANCEL_ACTION);
+}
+
+/** The rung's label + its consequence line, one owner for both board surfaces. */
+export const CANCEL_LABEL = 'Cancel it';
+export const CANCEL_NOTE =
+  "Off every list, record kept and struck through. Not the same as done.";
+
 // --- routine_match correction (#13) ------------------------------------------
 // A left-swipe reject says "not that item" and stops there. These two actions are
 // the richer doors behind the card's "What did this mean?" tap: `correct` carries
