@@ -41,6 +41,9 @@ import {
   type CaptureCorrection,
   type CaptureEarned,
 } from '../lib/algernon/captureDetectors';
+// Namespace import so the removal recipe's pin can resolve names it NAMES,
+// rather than only the ones this file happened to import individually.
+import * as detectors from '../lib/algernon/captureDetectors';
 
 /**
  * The CRT capture detectors (queue slot 11, lane 1).
@@ -1218,19 +1221,124 @@ describe('reported-shape invariant', () => {
     }
   });
 
+  it('an asserted split on the FIRST segment is refused, not honoured', () => {
+    // The guard exists because there is nothing in front of segment 0 to split
+    // away from, and `CaptureThread.split` documents "null for the first,
+    // which was never guessed at". Without the guard that contract is false —
+    // and the shape invariant CANNOT see it, because one thread carrying a
+    // bogus split still has threadCount 1 and threads.length 1. It needs its
+    // own assertion, on the field that actually goes wrong.
+    //
+    // Reachable the moment lane 2 offers the correction per-segment, which is
+    // the only sensible way to offer it.
+    const text = 'soil ph came back 5.2\nkyle moved the yarmouth run to thursday';
+    const before = stepCapture(ground(), text);
+    const first = correctCapture(
+      before.earned,
+      { id: 'separate_threads', text: 'soil ph came back 5.2' },
+      before.analysis,
+    );
+    const after = stepCapture(first, text);
+    expect(after.splits).toEqual([]);
+    expect(after.threadCount).toBe(1);
+    expect(after.threads[0].split).toBeNull(); // ← the assertion with teeth
+
+    // POSITIVE CONTROL on the nearest admissible neighbour: the very same
+    // correction one segment later IS honoured. Without this, the refusal
+    // above passes just as well against a build that honours nothing.
+    const second = correctCapture(
+      before.earned,
+      { id: 'separate_threads', text: 'kyle moved the yarmouth run to thursday' },
+      before.analysis,
+    );
+    const ok = stepCapture(second, text);
+    expect(ok.splits).toHaveLength(1);
+    expect(ok.splits[0].origin).toBe('operator');
+    expect(ok.threads[0].split).toBeNull();
+    expect(ok.threads[1].split).not.toBeNull();
+  });
+
   it('the SOURCE pair is one-directional on purpose', () => {
     // The declared exception, with its rationale AT the assertion so the next
     // reader meets the decision instead of rediscovering the argument.
     // `is_a_source` is loggable but not applicable: a source TITLE is a
     // SUBSTRING of a segment, not a segment, so naming one needs a picker that
-    // is not in v1. Every applicable correction can be completed by naming a
-    // segment — that is the rule, and this is the case it excludes.
+    // is not in v1.
+    //
+    // The rule, stated so it survives its own exceptions: a correction is
+    // applicable iff the operator can supply everything it needs, and where it
+    // needs a LOCATION that location is a segment. Not "every applicable
+    // correction names a segment" — `one_thought` names none and is
+    // applicable, because it needs no location.
     expect(CAPTURE_CORRECTION_IDS).toContain('is_a_source');
     const applicable = EVERY_LATCHABLE.map((c) => c.id);
     expect(applicable).not.toContain('is_a_source');
     // Positive control: its INVERSE is applicable, so this is a statement about
     // that one direction and not about the source detector being unreachable.
     expect(applicable).toContain('not_a_source');
+  });
+});
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * The Q2 removal recipe — the reversal's only evidence, pinned
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+describe('the Q2 removal recipe', () => {
+  // WHY THIS IS A TEST AND NOT A COMMENT. The Q2 ruling shipped the least
+  // certain guess on the page, and it rested on the removal being cheap. That
+  // paragraph is the whole of the evidence for it — and it had ALREADY gone
+  // stale once, in the commit that fixed WARN-2: it still instructed removing
+  // `CaptureAnalysis.threadCount`, a field that commit had deleted, while
+  // saying nothing about the correction machinery the same commit added.
+  //
+  // A recipe that has drifted is worse than no recipe, because it reads as
+  // though somebody checked. So the constructs it names are resolved here: the
+  // next thing to move reds a test instead of rotting a paragraph.
+
+  it('every construct the recipe names still exists', () => {
+    const NAMED_BY_RECIPE = [
+      'detectThreadSplits', 'groupThreads', 'effectiveSplits', 'threadMarkerFor',
+      'contentWords',
+      'CAPTURE_THREAD_MARKERS', 'CAPTURE_THREAD_OVERLAP_CEILING',
+      'CAPTURE_THREAD_MIN_CONTENT_WORDS', 'CAPTURE_THREAD_CONFIDENCE_BASE',
+      'CAPTURE_THREAD_CONFIDENCE_SPAN', 'CAPTURE_THREAD_STOPWORDS',
+      'CAPTURE_GROUND_STATE', 'freshGroundState', 'CAPTURE_CORRECTION_IDS',
+      'correctCapture',
+    ] as const;
+    for (const name of NAMED_BY_RECIPE) {
+      expect([name, name in detectors]).toEqual([name, true]);
+    }
+    // The recipe says SIX `CAPTURE_THREAD_*` constants. It said five before the
+    // stopword list joined them, which is exactly how a count goes quietly
+    // wrong — so the number is derived here rather than trusted.
+    const threadConstants = Object.keys(detectors).filter((k) => k.startsWith('CAPTURE_THREAD_'));
+    expect(threadConstants).toHaveLength(6);
+  });
+
+  it('does NOT name anything already deleted', () => {
+    // The specific rot that happened. `CaptureAnalysis.threadCount` is gone —
+    // deliberately, because a second count is a second place to be wrong — and
+    // an instruction to remove it would be an instruction into thin air.
+    expect(Object.keys(analyzeCapture(DEMO_TYPED))).not.toContain('threadCount');
+    // …and the state's count, which replaced it, IS there.
+    expect(Object.keys(stateOf(DEMO_TYPED))).toContain('threadCount');
+  });
+
+  it('the coupling cost the recipe states is REAL: correctCapture takes the analysis', () => {
+    // Step 6, the one part of the removal that escapes the thread surface.
+    // `analysis` is consumed by the `one_thought` case and nothing else, so
+    // deleting the thread detector changes a signature every caller passes.
+    // If that parameter ever goes away for another reason, the recipe is
+    // overstating the cost and this reds.
+    expect(correctCapture).toHaveLength(3);
+    const before = stepCapture(ground(), DEMO_TYPED);
+    // Driven, not merely counted: the parameter is load-bearing for
+    // `one_thought` specifically — pass an analysis with no splits in it and
+    // there is nothing for the correction to collapse.
+    const wrong = correctCapture(before.earned, { id: 'one_thought' }, analyzeCapture('nothing here'));
+    expect(stepCapture(wrong, DEMO_TYPED).threadCount).toBe(2);
+    const right = correctCapture(before.earned, { id: 'one_thought' }, before.analysis);
+    expect(stepCapture(right, DEMO_TYPED).threadCount).toBe(1);
   });
 });
 

@@ -431,11 +431,35 @@ export function formatOpenQuestionsSection(
 
 /**
  * REMOVAL RECIPE (the Q2 reversal, kept true rather than merely claimed).
- * Deleting this detector is: drop `detectThreadSplits` + `groupThreads` + the
- * five `CAPTURE_THREAD_*` constants, drop `threadSplits`/`threadCount` from
- * `CaptureAnalysis`, and drop the `threadCount > 1` clause from the commit
- * gate. Nothing else reads them. Every capture then has one thread and no other
- * behaviour changes.
+ *
+ * THE COST WENT UP. The first version of this recipe said "nothing else reads
+ * them", and the operator-correction machinery added since has made that false.
+ * Recorded here rather than quietly repaired, because the Q2 ruling rested on
+ * this reversal being cheap and this paragraph is that argument's only
+ * evidence — a recipe that has silently drifted is worse than none, since it
+ * reads as though somebody checked.
+ *
+ * Deleting this detector is now:
+ *   1. `detectThreadSplits`, `groupThreads`, `effectiveSplits`, `threadMarkerFor`,
+ *      `contentWords`, and the six `CAPTURE_THREAD_*` constants.
+ *   2. `threadSplits` from `CaptureAnalysis`; `splits`, `threadCount` and
+ *      `threads` from `CaptureState`; the `CaptureThreadSplit` and
+ *      `CaptureThread` types.
+ *   3. `assertedSplits` + `dismissedSplits` from `CaptureEarned`, from
+ *      `CAPTURE_GROUND_STATE`, and from `freshGroundState`.
+ *   4. The `one_thought` and `separate_threads` ids from
+ *      `CAPTURE_CORRECTION_IDS`, their `CaptureCorrection` members, and their
+ *      two `correctCapture` cases.
+ *   5. The `threadCount > 1` clause from the commit gate.
+ *   6. **`correctCapture`'s third parameter.** `analysis` is consumed by the
+ *      `one_thought` case AND NOTHING ELSE, so removing the thread detector
+ *      changes a PUBLIC SIGNATURE every caller of `correctCapture` passes —
+ *      the one part of this that is not confined to the thread surface.
+ *
+ * So the reversal is still real, and it is no longer free: it is a contained
+ * deletion plus one breaking signature change. `captureDetectors.test.ts` pins
+ * the constructs this list names, so the next thing to move here reds a test
+ * instead of rotting a paragraph.
  *
  * The sketch's `TOPICS` regexes (field/dispatch vocabulary) are demo
  * scaffolding, NOT contract — the design says so outright. They cannot ship:
@@ -1007,7 +1031,14 @@ export type CaptureCorrectionId = (typeof CAPTURE_CORRECTION_IDS)[number];
  *
  * THE RULE FOR MEMBERSHIP, which used to be applied to one of the two inverse
  * corrections and not the other: a correction is applicable here iff the
- * operator can COMPLETE it by naming a segment.
+ * operator can supply everything it needs — and WHERE IT NEEDS A LOCATION,
+ * that location is a SEGMENT.
+ *
+ * The second clause is not padding, and the shorter "iff the operator can
+ * complete it by naming a segment" was wrong: `one_thought` names no segment
+ * and is applicable, because it needs no location at all — it collapses
+ * whatever is currently shown. A universal whose very next sentence carves out
+ * an exception is not the rule; this is.
  *
  * "There is a split the detector missed" is incomplete on its own — the page
  * cannot place a thread boundary it was never told the position of, and
