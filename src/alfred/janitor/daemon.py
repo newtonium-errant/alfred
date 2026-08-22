@@ -473,8 +473,9 @@ async def run_sweep(
                         # 2026-08-22 — persist the classified failure so the
                         # janitor BIT ``agent-failure-kind`` probe can surface a
                         # quota / auth outage. Before this, ``kind`` was logged
-                        # here and dropped: 1,029 failing sweeps and a green
-                        # ``janitor ok`` on the BIT line. ``state.save()`` at the
+                        # here and dropped: a green ``janitor ok`` on the BIT
+                        # line through 1,029 failing sweeps (box, 2026-08-22
+                        # ~12:00 UTC). ``state.save()`` at the
                         # end of the sweep persists it.
                         state.record_agent_failure(
                             kind=agent_result.kind,

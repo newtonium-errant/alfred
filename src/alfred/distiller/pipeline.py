@@ -319,8 +319,9 @@ async def _call_llm(
             stderr=raw_stderr[:500],
         )
         # 2026-08-22 — carry the classified failure up to the state owner. Until
-        # now ``kind`` reached this log line and stopped: 246 failing calls and a
-        # green ``distiller ok`` on the BIT line.
+        # now ``kind`` reached this log line and stopped: a green
+        # ``distiller ok`` on the BIT line through 246 failing calls (box,
+        # 2026-08-22 ~12:00 UTC).
         outcomes.record_failure(result.kind, result.summary)
         # Return raw stdout (may be empty) rather than the backend's
         # error-summary string like "Exit code 1: ". The caller's

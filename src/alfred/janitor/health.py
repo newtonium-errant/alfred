@@ -16,9 +16,12 @@ the daemon's existing state file.
 
 ``agent-failure-kind`` was added 2026-08-22 and answers the question
 ``last-successful-sweep`` cannot: the sweep loop can cycle perfectly
-while every agent call inside it fails. It did, for 1,029 logged
-failures, against a green ``janitor ok``. Severity mapping is shared
-with curator and distiller in ``alfred.health.agent_failure``.
+while every agent call inside it fails. It did, against a green
+``janitor ok`` — 1,029 logged failures, measured on the box 2026-08-22
+~12:00 UTC. That count is point-in-time operator state, not a fact this
+repo can check; the durable claim is that the loop cycled while the work
+inside it did not. Severity mapping is shared with curator and distiller
+in ``alfred.health.agent_failure``.
 """
 
 from __future__ import annotations
@@ -244,8 +247,9 @@ def _check_agent_failure_kind(raw: dict[str, Any]) -> CheckResult:
 
     Same severity mapping as curator's, from the same function — see
     :func:`alfred.health.agent_failure.agent_failure_check`. Added 2026-08-22,
-    when janitor was measured logging 1,029 quota-failure lines while its BIT
-    line read ``janitor ok``: the backend had classified every one of those
+    when janitor was measured logging 1,029 quota-failure lines (on the box,
+    ~12:00 UTC — point-in-time) while its BIT line read ``janitor ok``: the
+    backend had classified every one of those
     failures, and nothing downstream kept the classification.
 
     The recovery comparison uses ``last_agent_success``, NOT the sweep

@@ -2,7 +2,8 @@
 
 On 2026-08-22 the box's ``claude -p`` weekly quota was exhausted and the BIT
 reported ``curator fail``, ``janitor ok``, ``distiller ok`` — while janitor had
-logged 1,029 quota failures and distiller 246. All three backends classified
+logged 1,029 quota failures and distiller 246 (measured on the box 2026-08-22
+~12:00 UTC; point-in-time operator state, not checkable from this repo). All three backends classified
 every one of those failures identically (the PRODUCING half was already
 shared); only curator kept the answer. This module pins the CONSUMING half now
 that all three have it: the streak arithmetic, the severity mapping, and — the
@@ -599,3 +600,98 @@ def test_janitor_and_distiller_have_no_such_laundering_path(tmp_path: Path) -> N
              "distiller": {"state": {"path": str(tmp_path / "distiller_state.json")}}}
     assert janitor_probe(j_raw).status is Status.FAIL
     assert distiller_probe(d_raw).status is Status.FAIL
+
+
+def test_the_preference_filter_call_site_still_omits_bump_last_run() -> None:
+    """PREMISE PIN for the defect above — added in the gate fix round.
+
+    The laundering pin calls ``mark_processed`` itself with the production
+    kwargs. That reproduces the SYMPTOM but cannot see a production-side repair:
+    the gate applied the obvious alternative fix (``bump_last_run=False`` at the
+    preference-filter call site), and both pins stayed green — the suite would
+    have gone on asserting ``Status.OK`` and defending a bug that no longer
+    existed, directly contradicting the "delete the pin when it reds"
+    instruction it carries.
+
+    So assert the premise the symptom pin rests on, structurally, against the
+    source: the ``mark_processed`` call whose ``backend_used`` is
+    ``"preference_filter_inbox"`` passes no ``bump_last_run``. Fix production
+    and THIS reds first, which is the signal to delete both.
+
+    Bound to the CALL's own keywords via AST rather than to text near it — a
+    regex over the source would match a ``bump_last_run`` appearing in the
+    comment block that call site already carries.
+    """
+    import ast
+    import inspect
+
+    from alfred.curator import daemon as curator_daemon
+
+    tree = ast.parse(inspect.getsource(curator_daemon))
+    targets = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        kwargs = {kw.arg: kw for kw in node.keywords if kw.arg}
+        backend = kwargs.get("backend_used")
+        if backend is None or not isinstance(backend.value, ast.Constant):
+            continue
+        if backend.value.value == "preference_filter_inbox":
+            targets.append(kwargs)
+
+    assert len(targets) == 1, (
+        f"expected exactly one preference-filter mark_processed call site, "
+        f"found {len(targets)} — the defect pin's premise is about a specific "
+        f"call site and can no longer identify it"
+    )
+    assert "bump_last_run" not in targets[0], (
+        "PRODUCTION WAS FIXED: the preference-filter call site now passes "
+        "bump_last_run, so curator no longer launders an active outage. Delete "
+        "this pin AND test_curator_last_run_can_be_bumped_without_an_agent_"
+        "success — the latter now asserts a bug that is gone."
+    )
+
+
+@pytest.mark.parametrize(
+    "stored,expected_next",
+    [(5, 6), (1, 2), (0, 2), (-3, 2), ("junk", 2), (None, 2)],
+    ids=["five", "one", "zero", "negative", "corrupt", "missing"],
+)
+def test_extend_base_floor_is_measured_not_assumed(stored: Any, expected_next: int) -> None:
+    """PREMISE PIN for ``read_streak``'s floor — added in the gate fix round.
+
+    ``read_streak`` floors at 1, and ``next_failure_record`` extends with
+    ``read_streak(prior) + 1``. So a stored ``0`` or negative yields 2, where
+    curator's pre-2026-08-22 inline ``max(prior_streak, 0) + 1`` yielded 1.
+    Every other input matches the old arithmetic exactly — these six rows are
+    the measurement, and ``zero``/``negative`` are the only two that moved.
+
+    Kept deliberately: the divergence escalates one failure EARLIER, which is
+    the speak-up direction for an instrument allowed to be wrong, and no writer
+    produces a non-positive ``consecutive``. Pinned because the docstring makes
+    a claim about it, and an unpinned claim about arithmetic is how the
+    docstring came to be wrong in the first place.
+    """
+    prior = {"ts": _iso(1)}
+    if stored is not None:
+        prior["consecutive"] = stored
+    rec = next_failure_record(
+        prior=prior, last_success_ts="", kind=QUOTA_LIMITED, summary=TAIL
+    )
+    assert rec["consecutive"] == expected_next
+
+
+def test_extend_base_floor_matches_legacy_arithmetic_on_every_sane_input() -> None:
+    """The positive control: for every value a WRITER can actually produce,
+    the new arithmetic is identical to curator's old inline form.
+
+    Without this the pin above reads as "the arithmetic changed" when what
+    happened is "the arithmetic changed on two impossible inputs".
+    """
+    for stored in range(1, 12):
+        legacy = max(stored, 0) + 1
+        rec = next_failure_record(
+            prior={"ts": _iso(1), "consecutive": stored},
+            last_success_ts="", kind=QUOTA_LIMITED, summary=TAIL,
+        )
+        assert rec["consecutive"] == legacy, f"diverged at a REACHABLE value: {stored}"

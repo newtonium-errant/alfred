@@ -1,8 +1,8 @@
 """Distiller's agent-failure state, sink threading, and probe (2026-08-22).
 
 The gap this closes: distiller's ``pipeline._call_llm`` classified 246 quota
-failures on 2026-08-22, logged every ``kind`` on ``pipeline.llm_failed``, and
-dropped it — the BIT read ``distiller ok`` for the whole outage. Distiller is
+failures on 2026-08-22 (box, ~12:00 UTC — point-in-time), logged every ``kind``
+on ``pipeline.llm_failed``, and dropped it — the BIT read ``distiller ok`` for the whole outage. Distiller is
 the awkward one of the three: its agent call is four frames below the daemon
 that owns state, so the fix needs a sink threaded down AND applied back up.
 Both halves are driven here, plus the structural pin that keeps the sink

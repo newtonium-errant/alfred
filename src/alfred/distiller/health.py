@@ -17,7 +17,8 @@ Probes:
     (2026-08-22). Answers what last-successful-extraction cannot: a run
     is recorded whether or not the LLM calls inside it succeeded, so an
     extraction cycle can tick on schedule with nothing being extracted.
-    It did, for 246 logged failures, against a green ``distiller ok``.
+    It did, against a green ``distiller ok`` — 246 logged failures,
+    measured on the box 2026-08-22 ~12:00 UTC (point-in-time).
     Severity mapping shared with curator and janitor in
     ``alfred.health.agent_failure``.
 """
@@ -404,7 +405,8 @@ def _check_agent_failure_kind(raw: dict[str, Any]) -> CheckResult:
     Same severity mapping as curator's and janitor's, from the same function —
     see :func:`alfred.health.agent_failure.agent_failure_check`. Added
     2026-08-22, when distiller was measured logging 246 quota-failure lines
-    while its BIT line read ``distiller ok``.
+    (on the box, ~12:00 UTC — point-in-time) while its BIT line read
+    ``distiller ok``.
 
     The recovery comparison uses ``last_agent_success``, NOT the run timestamps
     ``_check_last_successful_extraction`` reads. ``add_run`` fires at the end of

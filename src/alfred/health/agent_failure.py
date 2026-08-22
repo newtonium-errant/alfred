@@ -16,9 +16,12 @@ Mirror-write invariant, no per-tool copies. **The persist and surface halves
 were curator-only until 2026-08-22.** Until then the three backends all
 classified their failures identically and only curator kept the answer: on that
 morning the box's weekly quota was exhausted and the BIT reported ``curator
-fail`` with a precise, actionable message, ``janitor ok`` (1,029 dropped
-classifications) and ``distiller ok`` (246). The producing half being shared
-made that gap invisible — every tool looked wired.
+fail`` with a precise, actionable message, ``janitor ok`` and ``distiller ok``
+— through 1,275 dropped classifications between them (janitor 1,029, distiller
+246; measured on the box 2026-08-22 ~12:00 UTC and re-measured unchanged at
+14:44 — curator's own count moved +81 in that window, so treat any absolute
+here as point-in-time and believe the operator over this paragraph). The
+producing half being shared made that gap invisible — every tool looked wired.
 
 Why this exists (2026-07-29 incident): the box's Claude account hit its
 WEEKLY usage limit. Every ``claude -p`` structuring call failed ``exit 1``
@@ -269,8 +272,27 @@ def read_streak(failure: dict[str, Any] | None) -> int:
     A non-integer / negative value degrades to 1 rather than raising. The
     streak is an observability signal, not a correctness invariant, and a
     hand-edited count must not take a BIT run or a daemon's failure path down.
-    Degrading DOWNWARD is the safe direction: it can only delay an escalation
-    by one more failure, never manufacture one.
+
+    **The floor of 1 is conservative for one consumer and not the other, and
+    saying otherwise was wrong** (corrected 2026-08-22 at the gate; the earlier
+    wording claimed degrading "can only delay an escalation, never manufacture
+    one", which holds only for the first of these two):
+
+      * as a SEVERITY input (``agent_failure_check``), 1 is the lowest value
+        that still evidences a failure, so a corrupt count can only under-state
+        the outage — it delays escalation, never invents it;
+      * as the EXTEND BASE (``next_failure_record`` does ``read_streak(prior) +
+        1``), a stored ``0`` or negative yields 2 rather than the 1 curator's
+        pre-2026-08-22 inline ``max(prior, 0) + 1`` produced — one step CLOSER
+        to escalation. Measured at both ends; ``0`` and negatives are the only
+        inputs that diverge, and no writer produces either.
+
+    Kept rather than "fixed" because the divergence is in the speak-up
+    direction, which is the house rule for an instrument allowed to be wrong,
+    and because a corrupt count reaching the threshold one failure early is a
+    better failure than one that never reaches it. Pinned in
+    ``tests/health/test_agent_failure_shared.py`` so the claim is checked
+    rather than asserted.
 
     ``None`` (no failure recorded at all) reads as 0 — a caller distinguishing
     "never failed" from "failed once" needs that, and no writer ever produces

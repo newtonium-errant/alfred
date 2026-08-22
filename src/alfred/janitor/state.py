@@ -319,7 +319,8 @@ class JanitorState:
     # --- agent (``claude -p``) health ---------------------------------------
     # Janitor's half of the cross-tool agent-failure signal (2026-08-22). On
     # 2026-08-22 the box's weekly quota was exhausted and janitor had logged
-    # 1,029 ``sweep.agent_failed`` lines while its BIT reported ``janitor ok``:
+    # 1,029 ``sweep.agent_failed`` lines (measured on the box ~12:00 UTC —
+    # point-in-time operator state) while its BIT reported ``janitor ok``:
     # the backend already classified every one of them into a ``kind``, and the
     # daemon logged that kind and dropped it. Nothing persisted it, so no probe
     # could read it. These two methods are the missing consumer.

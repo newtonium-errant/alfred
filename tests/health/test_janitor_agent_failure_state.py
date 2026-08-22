@@ -1,7 +1,8 @@
 """Janitor's agent-failure state + daemon wiring (2026-08-22).
 
 The gap this closes: on 2026-08-22 janitor's backend classified 1,029
-quota failures, ``daemon.run_sweep`` logged every ``kind``, and nothing
+quota failures (box, ~12:00 UTC — point-in-time), ``daemon.run_sweep`` logged
+every ``kind``, and nothing
 persisted any of them — so the BIT read ``janitor ok`` for the whole outage.
 These pins DRIVE the writer (fabricate the failure, assert it lands and the
 probe reds) and pair each with its passing neighbour.

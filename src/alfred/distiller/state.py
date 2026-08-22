@@ -317,7 +317,8 @@ class DistillerState:
     # --- agent (``claude -p``) health ---------------------------------------
     # Distiller's half of the cross-tool agent-failure signal (2026-08-22). On
     # 2026-08-22 the box's weekly quota was exhausted and distiller had logged
-    # 246 ``pipeline.llm_failed`` lines while its BIT reported ``distiller ok``.
+    # 246 ``pipeline.llm_failed`` lines (measured on the box ~12:00 UTC —
+    # point-in-time operator state) while its BIT reported ``distiller ok``.
     # ``_call_llm`` already classified every one of them; nothing persisted it.
 
     def record_agent_failure(self, kind: str, summary: str) -> None:
