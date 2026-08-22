@@ -734,7 +734,12 @@ async def test_remove_accepts_no_fields_at_all(
     # not the spelling. An "-only" phrasing here would state something
     # false and send the model hunting for a typo that isn't there.
     assert "valid on: add, edit" in parsed["error"], parsed["error"]
-    assert "-only" not in parsed["error"], parsed["error"]
+    # Anchored to the exact rendering the OLD code produced, not a bare
+    # "-only" substring: a future ``meaning`` string containing a hyphenated
+    # "-only" anywhere would false-fail the loose form, and a pin that can
+    # fire for a reason unrelated to its subject stops being read as a
+    # signal.
+    assert "(it is edit-only)" not in parsed["error"], parsed["error"]
 
 
 def test_wrong_action_refusal_enumerates_the_actions_a_field_is_valid_on(
@@ -750,6 +755,67 @@ def test_wrong_action_refusal_enumerates_the_actions_a_field_is_valid_on(
 
     both = cli_items.describe_unsupported_field("priority", "remove")
     assert "valid on: add, edit" in both, both
+
+
+@pytest.mark.asyncio
+async def test_unsupported_fields_key_present_on_both_invalid_field_causes(
+    tmp_path, monkeypatch,
+) -> None:
+    """``invalid_field`` has TWO causes; the key must discriminate them.
+
+    A bad field VALUE is raised by the CLI and arrives through the
+    pass-through path; an unwritable field NAME is refused by the
+    dispatcher. Both answer ``kind=invalid_field``. A consumer separating
+    them with ``payload["unsupported_fields"] == []`` must not hit a
+    KeyError on the value cause — so the key is present on BOTH, and the
+    discriminator is the VALUE (empty vs not), never the key's presence.
+
+    Both causes are DRIVEN here rather than asserted about: the value
+    refusal goes through the real CLI so the empty list is proven to
+    survive the canary round-trip, not just to be set somewhere.
+    """
+    vault = tmp_path / "vault"
+    _write_routine(vault, "Core Daily", {
+        "type": "routine", "name": "Core Daily",
+        "cadence": {"type": "daily"},
+        "items": [{"text": "Pool Chemistry", "priority": "tracked"}],
+    })
+    monkeypatch.setattr(
+        subprocess, "run", _real_cli_runner(_cfg_file(tmp_path), []),
+    )
+    config = _salem_talker_config(tmp_path)
+
+    async def _call(fields):
+        return json.loads(await conversation._dispatch_routine_item(
+            tool_input={
+                "action": "edit", "record": "Core Daily",
+                "item": "Pool Chemistry", "fields": fields,
+            },
+            session=_session(), config=config,
+        ))
+
+    # Cause 1 — unwritable NAME, refused by the dispatcher.
+    name_cause = await _call({"slot": "fuel"})
+    assert name_cause["kind"] == ITEM_KIND_INVALID_FIELD, name_cause
+    assert name_cause["unsupported_fields"] == ["slot"], name_cause
+
+    # Cause 2 — bad VALUE, raised by the CLI, arrives via pass-through.
+    value_cause = await _call({"target_cadence_days": -5})
+    assert value_cause["kind"] == ITEM_KIND_INVALID_FIELD, value_cause
+    # The key is PRESENT (no KeyError) and empty — this is the assertion
+    # WARN-1 was about.
+    assert "unsupported_fields" in value_cause, value_cause
+    assert value_cause["unsupported_fields"] == [], value_cause
+
+    # The discriminator a consumer would actually write, on both causes.
+    assert bool(name_cause["unsupported_fields"]) is True
+    assert bool(value_cause["unsupported_fields"]) is False
+
+    # POSITIVE CONTROL — a SUCCESS also carries the key, so the guarantee
+    # is about every verdict-carrying response and not just refusals.
+    ok = await _call({"escalate_after_gap_days": 7})
+    assert ok["ok"] is True, ok
+    assert ok["unsupported_fields"] == [], ok
 
 
 @pytest.mark.asyncio

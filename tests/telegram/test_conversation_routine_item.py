@@ -651,7 +651,26 @@ async def test_routine_item_canary_added_passed_through(
         config=config,
     )
     parsed = json.loads(result_str)
-    assert parsed == payload
+    # Pass-through contract, asserted as INTENT rather than as exact dict
+    # equality: every field the CLI emitted must reach the model unchanged,
+    # so the dispatcher can never mangle or drop a canary field.
+    for key, value in payload.items():
+        assert parsed[key] == value, (key, parsed.get(key), value)
+
+    # The dispatcher additionally injects ``unsupported_fields`` EMPTY on
+    # this path (2026-08-21). ``invalid_field`` has two distinct causes — a
+    # bad field VALUE, raised by the CLI and arriving here, and an
+    # unwritable field NAME, refused by the dispatcher before it spawns —
+    # and a consumer separating them with ``== []`` would hit a KeyError on
+    # the value cause if the key were only present on refusals. Per the
+    # intentionally-left-blank data-shape rule, the key is present on every
+    # verdict-carrying response and the discriminator is its VALUE.
+    #
+    # This assertion is deliberately EXACT about the delta, so the
+    # pass-through contract stays tight: the CLI's payload plus exactly one
+    # documented key, never anything else the dispatcher invented.
+    assert set(parsed) - set(payload) == {"unsupported_fields"}, parsed
+    assert parsed["unsupported_fields"] == []
 
 
 @pytest.mark.asyncio

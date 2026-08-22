@@ -3424,9 +3424,14 @@ async def _dispatch_routine_item(
             "ok": False,
             "kind": ITEM_KIND_INVALID_FIELD,
             "error": message,
-            # Always present, even when empty, so a consumer can tell
-            # "refused for a named field" from "refused for some other
-            # reason" without parsing prose.
+            # NON-EMPTY here by construction — this branch is guarded by
+            # ``if unsupported:``. The empty case is supplied on the
+            # CLI-canary path at the bottom of this function, which is what
+            # makes the key present on every verdict-carrying response and
+            # lets a consumer separate the two ``invalid_field`` causes
+            # (bad VALUE vs unwritable NAME) on the value rather than on
+            # the key's presence. Pinned by
+            # ``test_unsupported_fields_key_present_on_both_invalid_field_causes``.
             "unsupported_fields": unsupported,
             "accepted_fields": sorted(accepted_item_fields(action)),
         })
@@ -3622,7 +3627,29 @@ async def _dispatch_routine_item(
             "kind": DONE_KIND_SUBPROCESS_ERROR,
         })
 
-    # --- Success/canary path: return parsed JSON verbatim ---------------
+    # --- Success/canary path: return the CLI's canary --------------------
+    #
+    # ``unsupported_fields`` is injected EMPTY here so the key is present on
+    # every CLI-canary response, not only on the name-refusal above. Without
+    # it the key would be conditionally present, and there are TWO distinct
+    # ``invalid_field`` causes: a bad field VALUE (raised by the CLI, arrives
+    # through this path) and an unwritable field NAME (refused above). A
+    # consumer separating them with ``payload["unsupported_fields"] == []``
+    # would hit a KeyError on the value cause.
+    #
+    # Per the intentionally-left-blank data-shape rule: an always-present
+    # field carrying an empty value beats one that appears only when
+    # populated, because absence cannot be told apart from a producer that
+    # never ran. The discriminator is now the VALUE (empty vs not), not the
+    # key's presence. ``setdefault`` so a future CLI that emits its own
+    # ``unsupported_fields`` wins rather than being silently overwritten.
+    #
+    # Scope of the guarantee, stated exactly: this covers every response
+    # carrying a tool VERDICT — the name-refusal plus every CLI canary.
+    # The transport-failure returns (timeout / crash / no-canary) and the
+    # early argument-validation errors carry no verdict and no such key;
+    # those are distinguishable by their own ``kind`` values.
+    parsed.setdefault("unsupported_fields", [])
     log.info(
         "talker.routine_item.result",
         session_id=session.session_id,
