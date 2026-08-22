@@ -260,6 +260,17 @@
         "gesture": "affirm"
       },
       {
+        "verb": "cancel",
+        "label": "Cancel it",
+        "weight": "heavy",
+        "note": "Marks the task cancelled — off every list. Not the same as done."
+      },
+      {
+        "verb": "undo_cancel",
+        "label": "Undo cancel",
+        "weight": "light"
+      },
+      {
         "verb": "snooze_1d",
         "label": "snooze_1d",
         "weight": "light"

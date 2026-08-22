@@ -105,6 +105,15 @@ log = structlog.get_logger(__name__)
 # are excluded.
 OPEN_STATUSES: frozenset[str] = frozenset({"todo", "active", "blocked"})
 
+# The "moot" disposition (#103) — closed, but NOT an achievement. Named here
+# because three things in this module now turn on it and a re-localized string
+# comparison is how the health-status ``skip`` miss happened three times in one
+# day. NOT imported from ``tier.task_cancel``: that module is the WRITER, and a
+# reader taking its vocabulary from the writer would make the two agree by
+# construction even if both were wrong about the schema. Both are pinned
+# against ``vault.schema.STATUS_BY_TYPE["task"]``, which is the source.
+CANCELLED_STATUS = "cancelled"
+
 
 def coerce_due_date(value: Any) -> date | None:
     """Coerce a frontmatter ``due`` value to a ``date``.
@@ -2001,15 +2010,43 @@ class TodayView:
 
 def _task_is_done_today(fm: dict, today: date) -> bool:
     """Return True iff a task record counts as completed for the daily
-    goal: status is closed (done/cancelled) AND it was closed today
-    (when a ``completed`` / ``done`` date is present), else just closed.
+    goal: status is ``done`` AND it was closed today (when a ``completed`` /
+    ``done`` date is present), else just done.
 
-    Defensive: a closed task without a completion date still counts
+    Defensive: a done task without a completion date still counts
     (operator marked it done; we can't prove it wasn't today, and
     counting it keeps the goal encouraging rather than pedantic).
+
+    CANCELLED IS NOT DONE (#103), and this docstring used to say it was
+    ("status is closed (done/cancelled)") — with the code agreeing. That was
+    never merely theoretical: ``vault-talker/SKILL.md`` names
+    ``set_fields {"status": "cancelled"}`` as the RECOMMENDED DEFAULT when the
+    operator asks Salem to remove a task, and ``cancelled_at`` is not among the
+    completion-date keys below, so every such task fell through to the
+    unconditional ``return True`` and was counted toward the daily goal as
+    something he had COMPLETED. The board verb makes that path one tap instead of
+    one conversation; it did not create it. Either way it is the operator's own
+    complaint — *"I don't want to mark it done"* — implemented as a feature.
+    A cancellation is the ABSENCE of an achievement, not a cheap one.
+
+    REACHABLE THROUGH ``entry_is_done``, AND PINNED THERE. ``compute_today_view``
+    drops cancelled task entries before they reach the lanes, which SHADOWS this
+    correction on that one path — a mutation removing the ``CANCELLED_STATUS``
+    clause leaves the curated-goal pin green, because the entry never arrives.
+    That shadow is why the fix needs its own driver: ``entry_is_done`` is called
+    directly by ``day_plan`` and by the feed producer over their OWN caches, and
+    those callers do not go through ``compute_today_view``'s drop. A cancelled
+    record genuinely reaches this predicate there.
+
+    So the pin that makes this line load-bearing drives ``entry_is_done`` — the
+    named consumer — not just this private function
+    (``test_cancelled_task_is_not_done_via_the_shared_predicate``). Without it
+    the correction was defended by exactly one direct-call assertion, and the
+    consumers this docstring cites as the REASON for the fix had nothing
+    covering them.
     """
     status = str(fm.get("status") or "todo").lower()
-    if status in OPEN_STATUSES:
+    if status in OPEN_STATUSES or status == CANCELLED_STATUS:
         return False
     # Closed. If a completion date is present, only count today's.
     for key in ("completed", "done", "completed_at", "closed"):
@@ -2138,12 +2175,93 @@ def compute_today_view(
         if c.gap_escalated:
             auto_gap_escalated_t1_keys.add(k)
 
+    # CANCELLED TASKS LEAVE THE PLAN ENTIRELY (#103).
+    #
+    # Every AUTO producer above already drops them for free — each walks the
+    # task dir behind ``status not in OPEN_STATUSES`` (or, for the returned
+    # candidates, ``status != "todo"``), and ``cancelled`` is in neither set. A
+    # CURATED entry is the one shape that does not, because curation is read
+    # from the daily file and is authoritative by design: the operator put it on
+    # today's list, so nothing re-asks the record whether it still wants to be
+    # there.
+    #
+    # THAT ASYMMETRY IS A LIVE DEFECT, NOT A LATENT ONE, and this comment said
+    # the opposite until it was checked. The first draft read "harmless while
+    # nothing wrote ``cancelled`` at runtime" — false: ``vault-talker/SKILL.md``
+    # instructs Salem that ``set_fields {"status": "cancelled"}`` is the
+    # RECOMMENDED DEFAULT when the operator asks to remove a task, so every task
+    # he has ever asked Salem to cancel has been counted toward his daily goal as
+    # something he COMPLETED. The board verb below does not introduce this bug; it
+    # makes it frequent. Corrected here rather than only in commit history,
+    # because this comment is where the next reader meets the claim.
+    #
+    # MEASURED at c552fa09 on a curated T1 whose record was cancelled,
+    # ``compute_today_view``
+    # reported ``t1_count=1 t1_done=1 all_t1_done=True`` — because
+    # ``_task_is_done_today`` treats every closed status as done, and
+    # ``cancelled_at`` is not one of the completion-date keys it checks. So a
+    # cancellation counted as an ACHIEVEMENT and the brief would have told the
+    # operator he finished his T1. That is the precise falsification the
+    # operator refused when he said *"I don't want to mark it done"* — shipping
+    # the cancel verb without this would have handed his own complaint back to
+    # him in the daily goal.
+    #
+    # Dropping the entry (rather than merely making the predicate answer False)
+    # is the fix, and the alternative is worse: a cancelled task left in the
+    # lane with ``done=False`` renders as an open, actionable card whose ✓ would
+    # flip ``cancelled`` straight to ``done``. Neither a to-do nor an
+    # achievement is what *moot* means, and neither is what it should look like.
+    # ``_task_is_done_today`` is corrected in the same commit as defence in
+    # depth for any future surface that reaches it another way.
+    # SCANNED ONLY WHEN THERE IS SOMETHING TO FILTER. The set is consumed by
+    # curated entries alone (every auto producer already drops cancelled records
+    # on its own walk), so on an un-curated day this was a second full-directory
+    # frontmatter walk whose result nothing read.
+    cancelled_task_names: set[str] = set()
+    task_dir = vault_path / "task"
+    _curated_task_entries = bool(
+        curation is not None and (curation.t1 or curation.t2)
+    )
+    if _curated_task_entries and task_dir.is_dir():
+        import frontmatter as _fm_mod
+
+        for _p in task_dir.glob("*.md"):
+            try:
+                _meta = dict(_fm_mod.load(str(_p)).metadata or {})
+            except Exception:  # noqa: BLE001 — an unreadable record is not a cancel
+                continue
+            if _meta.get("type") != "task":
+                continue
+            if str(_meta.get("status") or "").strip().lower() == CANCELLED_STATUS:
+                cancelled_task_names.add(str(_meta.get("name") or _p.stem).lower())
+
+    # The names ACTUALLY dropped from a lane — reported after the build, not
+    # before it. The first version of this logged the cancelled records FOUND in
+    # the vault under the event name ``..._excluded``, which is a different set:
+    # it fired ``count=2`` on a vault with two cancelled tasks and zero curated
+    # entries, where nothing was excluded at all, and it dumped every cancelled
+    # task name on every today-view forever. An observability line whose name
+    # does not describe its number is worse than none — and the pin asserted the
+    # wrong behaviour, encoding the overstatement as spec.
+    _excluded_names: list[str] = []
+
+    def _is_cancelled_task_entry(entry: TierEntry) -> bool:
+        hit = (
+            entry.origin == "task"
+            and (entry.name or "").strip().lower() in cancelled_task_names
+        )
+        if hit:
+            _excluded_names.append(entry.name)
+        return hit
+
     # 1. Curated entries first (authoritative). Annotate with the auto
     # reason/due when the same item also auto-surfaces (so the render is
     # a pure read of the lane, curated entries included).
     if curation is not None:
         for e in curation.t1:
             entry = _curated_to_tier_entry(e, tier=1)
+            if entry is not None and _is_cancelled_task_entry(entry):
+                continue
             if entry is not None:
                 k = _entry_key(entry, _task_key, _routine_key)
                 if entry.surface_reason is None and k in auto_reason_by_t1_key:
@@ -2164,6 +2282,8 @@ def compute_today_view(
                 t1_keys.add(k)
         for e in curation.t2:
             entry = _curated_to_tier_entry(e, tier=2)
+            if entry is not None and _is_cancelled_task_entry(entry):
+                continue
             if entry is not None:
                 t2.append(entry)
                 t2_keys.add(_entry_key(entry, _task_key, _routine_key))
@@ -2184,6 +2304,22 @@ def compute_today_view(
                 curated_t3_texts.add(
                     (entry.item_text or entry.name).strip().lower()
                 )
+
+    # ILB: a card vanishing without a trace is exactly the silent absence this
+    # rule exists to close — "where did that go?" must be greppable. Fires only
+    # when something WAS dropped, and names only those entries, so the count and
+    # the event name describe the same set.
+    if _excluded_names:
+        log.info(
+            "tier.today_view.cancelled_tasks_excluded",
+            count=len(_excluded_names),
+            names=sorted(_excluded_names),
+            detail=(
+                "curated entries whose task record is cancelled — dropped from "
+                "today's lanes; a cancellation is not a to-do and not an "
+                "achievement"
+            ),
+        )
 
     # 2. Auto-T1 task candidates (append if not already curated).
     for c in auto_t1_task:

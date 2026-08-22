@@ -505,6 +505,14 @@ def test_snooze_ceiling_admits_exactly_the_ratified_verbs() -> None:
         # board ✓ hold; deliberate widening, updated in lockstep per the
         # contract-pin rule.
         "done_1d", "done_2d", "done_3d",
+        # The CANCEL disposition (#103, 2026-08-22) — the operator's "no quick
+        # way to remove a card without talking to Salem" report. Third
+        # deliberate widening, same lockstep rule. These two are the first
+        # ceiling verbs ``actions_for_item`` withholds by LANE (task-origin
+        # only); the ceiling stays the per-KIND declaration, so they belong here
+        # unconditionally and the per-item narrowing is pinned separately in
+        # tests/tier/test_task_cancel.py.
+        "cancel", "undo_cancel",
     }
 
 

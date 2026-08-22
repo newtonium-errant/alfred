@@ -59,6 +59,15 @@ TASK_DONE_KIND_SUCCESS = "success"
 TASK_DONE_KIND_IDEMPOTENT_NOOP = "idempotent_noop"
 TASK_DONE_KIND_UNKNOWN_RECORD = "unknown_record"
 TASK_DONE_KIND_INVALID_STATUS = "invalid_status"
+#: Refused: the task is ``cancelled``. Distinct from ``invalid_status`` — the
+#: lifecycle IS recognised; we decline to overwrite a deliberate disposition.
+TASK_DONE_KIND_CANCELLED = "cancelled"
+
+#: The disposition this writer refuses to overwrite. Spelled from the schema
+#: vocabulary above rather than imported from ``tier.task_cancel`` — a reader
+#: taking its constant from the writer would agree with it by construction even
+#: if both were wrong about the schema.
+CANCELLED_STATUS = "cancelled"
 
 
 @dataclass
@@ -171,6 +180,39 @@ def mark_task_done(
                 date=str(fm.get(COMPLETED_FIELD) or date), status=DONE_STATUS,
             )
 
+        # THE MIRROR OF ``task_cancel``'s already-done refusal (#103). That writer
+        # refuses to cancel a completed task because closing it a second way
+        # would overwrite the completion; the identical argument runs in reverse
+        # and had no guard here. DRIVEN before it was written: a done-on-cancelled
+        # returned ``success`` and produced
+        # ``status: done`` + ``completed: <date>`` + ``cancelled_at: <date>`` +
+        # ``cancelled_from: blocked`` on one record — a task simultaneously
+        # claiming it was abandoned from ``blocked`` and finished today.
+        #
+        # PRE-EXISTING, BUT THIS LANE MAKES IT WORSE, which is why it is fixed
+        # here rather than boarded: before #103 nothing wrote the provenance
+        # fields, so the flip was merely a status change with no contradiction to
+        # strand. The stranded fields are this lane's own, so the guard is this
+        # lane's to add.
+        #
+        # ``cancelled`` is a legal task status, so this is NOT ``invalid_status``
+        # (the record's lifecycle is recognised — we simply refuse to overwrite a
+        # deliberate disposition). Its own kind, per the refusal-must-say-why
+        # rule: a caller reading only ``ok`` cannot tell these apart.
+        if status == CANCELLED_STATUS:
+            log.info(
+                "tier.task_done.refused_cancelled", path=task_path, name=name,
+                date=date,
+                detail=(
+                    "task is cancelled — completing it would overwrite the "
+                    "cancellation and strand its provenance fields; un-cancel first"
+                ),
+            )
+            return TaskCompletionResult(
+                kind=TASK_DONE_KIND_CANCELLED, path=task_path, name=name,
+                status=CANCELLED_STATUS,
+            )
+
         fm["status"] = DONE_STATUS
         fm[COMPLETED_FIELD] = date
         _write_record(record_path, fm, post.content)
@@ -185,6 +227,8 @@ def mark_task_done(
 __all__ = [
     "COMPLETED_FIELD",
     "DONE_STATUS",
+    "CANCELLED_STATUS",
+    "TASK_DONE_KIND_CANCELLED",
     "TASK_DONE_KIND_IDEMPOTENT_NOOP",
     "TASK_DONE_KIND_INVALID_STATUS",
     "TASK_DONE_KIND_SUCCESS",
