@@ -263,7 +263,7 @@
         "verb": "cancel",
         "label": "Cancel it",
         "weight": "heavy",
-        "note": "Marks the task cancelled — off every list, record kept and struck through. Not the same as done."
+        "note": "Marks the task cancelled — off every list. Not the same as done."
       },
       {
         "verb": "undo_cancel",

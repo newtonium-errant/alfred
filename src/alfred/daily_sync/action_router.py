@@ -771,16 +771,50 @@ ACTION_META: dict[str, dict[str, dict[str, Any]]] = {
         # sweep in one stroke, and (unlike a sort, which is reversible by
         # re-sorting) its reversal is only exact where THIS writer stamped the
         # provenance. The note says what it does, in the operator's own frame.
+        # The ``note`` is CORRECTED, not deleted, and the distinction was forced
+        # by a house invariant rather than chosen: ``test_every_heavy_verb_
+        # declares_its_consequence`` requires EVERY heavy verb on every kind to
+        # carry one ("a heavy verb with no note would arm a card that cannot say
+        # why"). Deleting it while keeping ``weight: heavy`` reddened that pin.
+        #
+        # What was wrong was the CLAIM, not the field. It said the record was
+        # "kept and struck through" — false for a task on every surface: all
+        # three ``line-through`` renderers gate on ``done``, ``ACTED_VERB_STAGE``
+        # has no ``cancel`` key so a cancelled card takes the ``planned``
+        # fallback, and ``compute_today_view`` drops the entry before the brief
+        # sees it. The phrase came from the GCal precedent, where it is true of
+        # Google's UI and true only there.
+        #
+        # "Nothing renders it today" is NOT a reason to drop it. That is a fact
+        # about the current UI (cancel carries no gesture, and ``note`` displays
+        # on the swipe-arm path), and the invariant is a DECLARATION contract,
+        # not a render contract — the weight and its reason travel together on
+        # the wire so a future surface that arms this verb inherits both.
         CANCEL_ACTION: {
             "label": "Cancel it",
             "weight": "heavy",
-            "note": (
-                "Marks the task cancelled — off every list, record kept and "
-                "struck through. Not the same as done."
-            ),
+            "note": "Marks the task cancelled — off every list. Not the same as done.",
         },
-        # LIGHT: the reversal of a heavy verb is not itself heavy, and it is
-        # exact (the cancel recorded the status it came from).
+        # ``undo_cancel`` IS GENUINELY INERT ON THE CLIENT TODAY, and saying so
+        # here is the point — it is a working, tested server capability with no
+        # UI surface, which is a different thing from dead code and must not be
+        # quietly mistaken for it.
+        #
+        # Three independent reasons nothing renders it: it carries no
+        # ``gesture``, so ``verbsFromActions`` never promotes it to a swipe;
+        # ``ringItemUndoable`` is hard-false for task-origin rows; and the deck's
+        # own "undo" is a 6-second PRE-COMMIT ABORT, not a reversal of a landed
+        # act. There is also no card left to hang it on — a cancelled task is
+        # dropped from the lanes by ``compute_today_view``, which is the whole
+        # point of the verb.
+        #
+        # So the reachable routes are chat and a direct POST. That is a
+        # legitimate state and it is left in place deliberately: the writer is
+        # real, pinned, and the documented reversal. Contrast the
+        # ``CLOSED_FAMILY`` constant this lane wrote and REMOVED — that was a
+        # branch that could never execute under any input. This is a capability
+        # that executes correctly and has no button yet. Removing it would delete
+        # working behaviour to tidy a UI gap.
         UNDO_CANCEL_ACTION: {"label": "Undo cancel", "weight": "light"},
     },
     "email_urgent": {
@@ -2011,10 +2045,18 @@ def _dispatch_slot_completion(
                 "feed.act.slot.undo_on_cancelled", id=feed_item_id, lane=lane,
                 action=action_id,
             )
+            # THE PARENTHETICAL NAMES A ROUTE THAT EXISTS. It said "use undo
+            # cancel to put it back" — pointing at a control the operator cannot
+            # find: ``undo_cancel`` is served but nothing renders it (no gesture,
+            # ``ringItemUndoable`` false for task rows, and the cancelled card is
+            # gone from the lanes anyway). A dead-control promise is the same
+            # failure class as the false strikethrough copy, one layer in, so it
+            # points at chat — the honest fallback this file already uses for
+            # un-accept and for task undo.
             return ActResult(
                 False, STATUS_INVALID_ACTION,
                 "this item is cancelled, not done — there's nothing to undo "
-                "(use undo cancel to put it back)",
+                "(un-cancel via chat)",
                 feed_item_id, action_id,
             )
         # Undo only when the item is CURRENTLY done — freshly board-acted
@@ -2513,6 +2555,16 @@ def _task_writer_detail(kind: str, name: str) -> str:
         return f"'{name}' is no longer a task at that path"
     if kind == "invalid_status":
         return f"'{name}' has an unrecognized status — refusing to guess the lifecycle"
+    # #103: the completion writer's mirror of the cancel writer's already-done
+    # refusal. Named rather than left to the generic fallback, which would say
+    # "could not complete" — true but useless, and indistinguishable from an
+    # unreadable record. The route it points at is chat, because that is the
+    # only place an un-cancel is reachable today.
+    if kind == "cancelled":
+        return (
+            f"'{name}' is cancelled — completing it would overwrite that. "
+            "Un-cancel it via chat first if it isn't really moot."
+        )
     return f"could not complete '{name}'"
 
 

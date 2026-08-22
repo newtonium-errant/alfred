@@ -2029,12 +2029,21 @@ def _task_is_done_today(fm: dict, today: date) -> bool:
     complaint — *"I don't want to mark it done"* — implemented as a feature.
     A cancellation is the ABSENCE of an achievement, not a cheap one.
 
-    Defence in depth rather than the live path: ``compute_today_view`` now drops
-    cancelled task entries from the lanes outright, so a cancelled record should
-    not reach this predicate at all. It is corrected anyway because
-    ``entry_is_done`` is shared with ``day_plan`` and the feed producer, and a
-    predicate that answers "done" for a status nobody completed is a trap for
-    whichever surface reaches it next.
+    REACHABLE THROUGH ``entry_is_done``, AND PINNED THERE. ``compute_today_view``
+    drops cancelled task entries before they reach the lanes, which SHADOWS this
+    correction on that one path — a mutation removing the ``CANCELLED_STATUS``
+    clause leaves the curated-goal pin green, because the entry never arrives.
+    That shadow is why the fix needs its own driver: ``entry_is_done`` is called
+    directly by ``day_plan`` and by the feed producer over their OWN caches, and
+    those callers do not go through ``compute_today_view``'s drop. A cancelled
+    record genuinely reaches this predicate there.
+
+    So the pin that makes this line load-bearing drives ``entry_is_done`` — the
+    named consumer — not just this private function
+    (``test_cancelled_task_is_not_done_via_the_shared_predicate``). Without it
+    the correction was defended by exactly one direct-call assertion, and the
+    consumers this docstring cites as the REASON for the fix had nothing
+    covering them.
     """
     status = str(fm.get("status") or "todo").lower()
     if status in OPEN_STATUSES or status == CANCELLED_STATUS:
@@ -2204,9 +2213,16 @@ def compute_today_view(
     # achievement is what *moot* means, and neither is what it should look like.
     # ``_task_is_done_today`` is corrected in the same commit as defence in
     # depth for any future surface that reaches it another way.
+    # SCANNED ONLY WHEN THERE IS SOMETHING TO FILTER. The set is consumed by
+    # curated entries alone (every auto producer already drops cancelled records
+    # on its own walk), so on an un-curated day this was a second full-directory
+    # frontmatter walk whose result nothing read.
     cancelled_task_names: set[str] = set()
     task_dir = vault_path / "task"
-    if task_dir.is_dir():
+    _curated_task_entries = bool(
+        curation is not None and (curation.t1 or curation.t2)
+    )
+    if _curated_task_entries and task_dir.is_dir():
         import frontmatter as _fm_mod
 
         for _p in task_dir.glob("*.md"):
@@ -2218,19 +2234,25 @@ def compute_today_view(
                 continue
             if str(_meta.get("status") or "").strip().lower() == CANCELLED_STATUS:
                 cancelled_task_names.add(str(_meta.get("name") or _p.stem).lower())
-    # ILB: a silent drop is indistinguishable from a producer that never ran.
-    if cancelled_task_names:
-        log.info(
-            "tier.today_view.cancelled_tasks_excluded",
-            count=len(cancelled_task_names),
-            names=sorted(cancelled_task_names),
-        )
+
+    # The names ACTUALLY dropped from a lane — reported after the build, not
+    # before it. The first version of this logged the cancelled records FOUND in
+    # the vault under the event name ``..._excluded``, which is a different set:
+    # it fired ``count=2`` on a vault with two cancelled tasks and zero curated
+    # entries, where nothing was excluded at all, and it dumped every cancelled
+    # task name on every today-view forever. An observability line whose name
+    # does not describe its number is worse than none — and the pin asserted the
+    # wrong behaviour, encoding the overstatement as spec.
+    _excluded_names: list[str] = []
 
     def _is_cancelled_task_entry(entry: TierEntry) -> bool:
-        return (
+        hit = (
             entry.origin == "task"
             and (entry.name or "").strip().lower() in cancelled_task_names
         )
+        if hit:
+            _excluded_names.append(entry.name)
+        return hit
 
     # 1. Curated entries first (authoritative). Annotate with the auto
     # reason/due when the same item also auto-surfaces (so the render is
@@ -2282,6 +2304,22 @@ def compute_today_view(
                 curated_t3_texts.add(
                     (entry.item_text or entry.name).strip().lower()
                 )
+
+    # ILB: a card vanishing without a trace is exactly the silent absence this
+    # rule exists to close — "where did that go?" must be greppable. Fires only
+    # when something WAS dropped, and names only those entries, so the count and
+    # the event name describe the same set.
+    if _excluded_names:
+        log.info(
+            "tier.today_view.cancelled_tasks_excluded",
+            count=len(_excluded_names),
+            names=sorted(_excluded_names),
+            detail=(
+                "curated entries whose task record is cancelled — dropped from "
+                "today's lanes; a cancellation is not a to-do and not an "
+                "achievement"
+            ),
+        )
 
     # 2. Auto-T1 task candidates (append if not already curated).
     for c in auto_t1_task:

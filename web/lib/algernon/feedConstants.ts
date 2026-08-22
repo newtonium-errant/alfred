@@ -888,10 +888,25 @@ export function cancelIsServed(item: FeedItem): boolean {
   return servedActions(item).some((a) => a.verb === CANCEL_ACTION);
 }
 
-/** The rung's label + its consequence line, one owner for both board surfaces. */
+/**
+ * The rung's label + its consequence line. USED BY THE DECK ONLY — an earlier
+ * version of this comment claimed "one owner for both board surfaces", which was
+ * false: no other surface imports it.
+ *
+ * THE NOTE SAYS ONLY WHAT IS TRUE ON THIS SURFACE. It read "record kept and
+ * struck through" until the gate drove all three renderers: every `line-through`
+ * site (SlotBoard, FeedRow, RingsHeader) gates on `done`, `ACTED_VERB_STAGE` has
+ * no `cancel` key so a cancelled card takes the `planned` fallback, and
+ * `compute_today_view` drops cancelled entries before the brief renders at all.
+ * Nothing anywhere strikes a cancelled TASK through. Strikethrough is real for a
+ * cancelled EVENT — that is Google's calendar UI — and borrowing the phrase
+ * across put a promise in the operator's hand that no surface keeps.
+ *
+ * What IS true, and all this now claims: it leaves the lists, and it is not a
+ * completion.
+ */
 export const CANCEL_LABEL = 'Cancel it';
-export const CANCEL_NOTE =
-  "Off every list, record kept and struck through. Not the same as done.";
+export const CANCEL_NOTE = 'Off every list. Not the same as done.';
 
 // --- routine_match correction (#13) ------------------------------------------
 // A left-swipe reject says "not that item" and stops there. These two actions are

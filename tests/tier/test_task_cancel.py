@@ -507,6 +507,10 @@ def test_cancel_ships_heavy_and_ungrouped() -> None:
     assert cancel["weight"] == "heavy"
     assert "group" not in cancel
     assert "gesture" not in cancel  # menu verb, never a swipe
+    # The served ``note`` is REQUIRED, not optional: a house invariant
+    # (``test_every_heavy_verb_declares_its_consequence``) makes every heavy verb
+    # on every kind carry one. Its TEXT was the defect, not its presence — see
+    # the strikethrough pin below.
     assert cancel["note"]
     # The when-family is still grouped — proving 'group' is live in this payload
     # and its absence on cancel is a decision, not a broken serializer.
@@ -732,16 +736,157 @@ def test_cancelled_task_is_not_done_today(tmp_path: Path) -> None:
     ) is False
 
 
-def test_cancel_excluding_lanes_announces_itself(tmp_path: Path) -> None:
-    """ILB: a silent drop is indistinguishable from a producer that never ran."""
+def test_the_exclusion_log_counts_what_it_says_it_counts(tmp_path: Path) -> None:
+    """ILB, and the pin that used to encode an overstatement as spec.
+
+    The first version of this asserted only that the event fired with
+    ``count=1`` for a vault holding one cancelled task — which passed against a
+    log that counted cancelled records FOUND IN THE VAULT under an event named
+    ``..._excluded``. Those are different sets, and the gate produced the
+    separating case: two cancelled tasks and NO curation logged ``count=2``
+    while excluding nothing.
+
+    Both directions now, because only the pair distinguishes the two readings."""
     from alfred.tier.compute import compute_today_view
+    from alfred.tier.daily_curation import DailyCuration, T1T2Entry, save_tier_curation
 
     vault = _vault(tmp_path)
     _task(vault, "Dropped", status="cancelled")
+    _task(vault, "Also Cancelled", status="cancelled")
+    # A LIVE curated task is load-bearing, not scenery: without one in the
+    # curated set, "append only when the entry is actually cancelled" and
+    # "append every curated entry" produce identical output, and a mutation
+    # removing the guard scored RED 0. It is the non-excluded neighbour that
+    # gives the count something to be wrong about.
+    _task(vault, "Live One", status="todo")
 
+    # NOTHING CURATED → nothing can be excluded → the line must NOT fire.
     with structlog.testing.capture_logs() as captured:
         compute_today_view(vault, NOW)
+    assert [
+        c for c in captured if c.get("event") == "tier.today_view.cancelled_tasks_excluded"
+    ] == []
 
-    hits = [c for c in captured if c.get("event") == "tier.today_view.cancelled_tasks_excluded"]
+    # Two curated, ONE of them cancelled → exactly one exclusion, named.
+    save_tier_curation(vault, TODAY, DailyCuration(
+        t1=[
+            T1T2Entry(task="Dropped", source="operator"),
+            T1T2Entry(task="Live One", source="operator"),
+        ],
+    ))
+    with structlog.testing.capture_logs() as captured:
+        compute_today_view(vault, NOW)
+    hits = [
+        c for c in captured if c.get("event") == "tier.today_view.cancelled_tasks_excluded"
+    ]
     assert len(hits) == 1
-    assert hits[0]["count"] == 1
+    assert hits[0]["count"] == 1, "counts EXCLUSIONS, not cancelled records found"
+    assert hits[0]["names"] == ["Dropped"]
+
+
+def test_cancelled_task_is_not_done_via_the_shared_predicate(tmp_path: Path) -> None:
+    """Drives the correction through ``entry_is_done`` — the NAMED CONSUMER that
+    ``day_plan`` and the feed producer call, over their own caches.
+
+    Why this exists as well as the direct-call pin: ``compute_today_view`` drops
+    cancelled entries before the lanes, which SHADOWS the fix on that path — the
+    curated-goal pin stays green against a build with the ``CANCELLED_STATUS``
+    clause removed, because the entry never arrives to be judged. The consumers
+    cited as the reason for the fix had nothing covering them until this.
+
+    Positive control in the same test: a DONE task through the identical call
+    answers True, so a green here cannot mean the predicate is simply dead."""
+    from alfred.tier.compute import TierEntry, build_done_caches, entry_is_done
+
+    vault = _vault(tmp_path)
+    _task(vault, "Moot", status="blocked")
+    _task(vault, "Finished", status="done", extra="completed: %s\n" % TODAY_ISO)
+    mark_task_cancelled(vault, "task/Moot.md", TODAY_ISO)
+
+    task_fm, completion_by_record = build_done_caches(vault)
+
+    cancelled_entry = TierEntry(tier=1, origin="task", name="Moot", path="task/Moot.md")
+    done_entry = TierEntry(tier=1, origin="task", name="Finished", path="task/Finished.md")
+
+    assert entry_is_done(
+        cancelled_entry, task_fm_by_name=task_fm,
+        completion_by_record=completion_by_record, today=TODAY,
+    ) is False
+    # POSITIVE CONTROL — the same call, the same caches, a real completion.
+    assert entry_is_done(
+        done_entry, task_fm_by_name=task_fm,
+        completion_by_record=completion_by_record, today=TODAY,
+    ) is True
+
+
+def test_completing_a_cancelled_task_is_refused(tmp_path: Path) -> None:
+    """The MIRROR of the cancel writer's already-done refusal.
+
+    Driven before the guard was written: a done-on-cancelled returned
+    ``success`` and produced ``status: done`` + ``completed`` + ``cancelled_at``
+    + ``cancelled_from`` on ONE record — a task claiming both that it was
+    abandoned from ``blocked`` and that it was finished today. Pre-existing, but
+    this lane makes it worse: the stranded provenance fields are this lane's own,
+    so the guard is this lane's to add.
+
+    Positive control: the same writer completes an open task in the same vault."""
+    from alfred.tier.task_completion import (
+        TASK_DONE_KIND_CANCELLED,
+        TASK_DONE_KIND_SUCCESS,
+        mark_task_done,
+    )
+
+    vault = _vault(tmp_path)
+    p = _task(vault, "Moot", status="blocked")
+    mark_task_cancelled(vault, "task/Moot.md", TODAY_ISO)
+    after_cancel = p.read_text(encoding="utf-8")
+    open_task = _task(vault, "Live", status="todo")
+
+    with structlog.testing.capture_logs() as captured:
+        refused = mark_task_done(vault, "task/Moot.md", TODAY_ISO)
+    allowed = mark_task_done(vault, "task/Live.md", TODAY_ISO)
+
+    assert refused.kind == TASK_DONE_KIND_CANCELLED
+    assert refused.ok is False
+    # Not one byte — and specifically NOT a record wearing both dispositions.
+    assert p.read_text(encoding="utf-8") == after_cancel
+    fm = _fm(p)
+    assert fm["status"] == CANCELLED_STATUS
+    assert "completed" not in fm
+    # The refusal says WHY — a bare ok=False is indistinguishable from an
+    # unreadable record or an unknown status.
+    hits = [c for c in captured if c.get("event") == "tier.task_done.refused_cancelled"]
+    assert len(hits) == 1
+    # POSITIVE CONTROL.
+    assert allowed.kind == TASK_DONE_KIND_SUCCESS
+    assert _fm(open_task)["status"] == "done"
+
+
+def test_no_surface_claims_a_cancelled_task_is_struck_through(tmp_path: Path) -> None:
+    """The blocking finding, pinned so the copy cannot drift back.
+
+    Strikethrough is real for a cancelled EVENT (Google's calendar UI) and false
+    for a cancelled TASK on every surface here: all three ``line-through``
+    renderers gate on ``done``, ``ACTED_VERB_STAGE`` carries no ``cancel`` key,
+    and the entry never reaches the brief. Asserting the ABSENCE of the phrase in
+    the two owners that describe the task cancel, with a positive control
+    proving the search can find it where it IS true."""
+    from alfred.daily_sync.action_router import ACTION_META
+
+    root = Path(__file__).resolve().parents[2]
+    # BOTH owners of the sentence, asserted together — the served note (kept,
+    # because the heavy-verb invariant requires it) and the rendered FE copy.
+    # The claim is what was wrong, so both are checked for the claim.
+    served_note = ACTION_META["slot_suggestion"][CANCEL_ACTION]["note"]
+    assert "struck" not in served_note.lower()
+    assert "kept" not in served_note.lower()
+
+    fe = (root / "web" / "lib" / "algernon" / "feedConstants.ts").read_text(encoding="utf-8")
+    note = fe.split("export const CANCEL_NOTE =", 1)[1].split(";", 1)[0]
+    assert "struck" not in note.lower()
+    assert "line-through" not in note.lower()
+
+    # POSITIVE CONTROL — the phrase IS present, and correct, where it describes
+    # Google's calendar. A grep that can never match proves nothing.
+    gcal = (root / "src" / "alfred" / "integrations" / "gcal_sync.py").read_text(encoding="utf-8")
+    assert "struck through" in gcal

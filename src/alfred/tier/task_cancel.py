@@ -50,9 +50,15 @@ empty, which is the conditionally-present-field drift ``feedback_intentionally
 _left_blank`` rules out (an always-absent field cannot be told apart from a
 producer that never ran). What IS knowable without asking is provenance, not
 motive: ``cancelled_from`` + ``cancelled_at`` answer *what state it was in* and
-*when it stopped*, and the record keeps its body, its links and its history per
-the GCal precedent (``status: cancelled`` is struck through and KEPT, never
-deleted). An operator who wants to say WHY still has the conversational path —
+*when it stopped*, and the record keeps its body, its links and its history —
+KEPT, never deleted. (The GCal precedent is what suggested that shape, and the
+comparison is exact only up to a point: an event cancelled in Google's calendar
+is struck through and stays VISIBLE there. A cancelled TASK is kept on DISK but
+disappears from every surface — the lanes drop it, no renderer strikes it
+through, and the Obsidian bases filter it out. Keeping the record is the shared
+half; the strikethrough belongs to events alone, and this file's earlier wording
+lent it to tasks.) An operator who wants to say WHY still has the conversational
+path —
 ``vault-talker/SKILL.md``'s ``task`` → ``set_fields {"status": "cancelled"}``
 recipe is unchanged and can carry any annotation he dictates. The board is the
 fast path; the conversation is the annotated one.
@@ -77,8 +83,9 @@ Contract (the same law as ``task_completion`` and the routine/tier writers):
 
 **Return suppression comes free, and is pinned rather than assumed.** The card
 in the operator's report surfaced via ``surface_reason: returned`` /
-``source: auto-returned``, produced by ``tier.compute._returned_task_candidates``
-— which skips any record whose ``status`` is not exactly ``"todo"``. So the
+``source: auto-returned``, produced by
+``tier.compute.compute_returned_task_candidates`` — which skips any record whose
+``status`` is not exactly ``"todo"``. So the
 status write alone stops the return; there is no second suppression list to
 maintain, and no snooze-store entry to write. The same single filter retires the
 card from the T1/T2 pools (``status not in OPEN_STATUSES``) and from the
@@ -314,8 +321,28 @@ def restore_cancelled_task(
     """Reverse a cancel — put the task back in the status it was cancelled from.
 
     Reads ``cancelled_from`` and restores it, clearing ``cancelled_at`` and
-    ``cancelled_from``. Exact, never a guess: this is the whole reason the cancel
-    stamps the prior status.
+    ``cancelled_from``.
+
+    **AS EXACT AS THE STAMP IT READS — which is not the same as exact.** This
+    docstring said "exact, never a guess" until the gate falsified it with a
+    reproducible sequence: board-cancel a ``blocked`` task (stamps
+    ``cancelled_from: blocked``); Salem revives it with
+    ``set_fields {"status": "todo"}``, which does NOT clear the provenance;
+    Salem cancels it again, which does not refresh it either. The record now
+    reads ``cancelled_from: blocked`` while the true prior status was ``todo``,
+    and this function reports ``success`` and restores the WRONG state — with no
+    signal that anything was off. Nothing here can detect that: the stale value
+    is well-formed and there is no second witness to check it against.
+
+    So the honest claim is narrower. A restore is exact when the LAST thing to
+    cancel the record was this writer, because ``mark_task_cancelled`` re-stamps
+    ``cancelled_from`` on every cancel it performs. It is only as good as the
+    stamp when some other writer cancelled last. Two consequences worth carrying:
+    the fix belongs at the writers that leave provenance behind (Salem's revive
+    and cancel recipes should clear or refresh these fields — a SKILL-layer
+    change, flagged to prompt-tuner), and the bound must not be mistaken for
+    safety merely because ``undo_cancel`` has no button today. That is a
+    coincidence of the current UI, not a defence.
 
       * ``unknown_record`` — as :func:`mark_task_cancelled`.
       * ``not_cancelled`` — the record is not ``status: cancelled``; there is
@@ -328,6 +355,11 @@ def restore_cancelled_task(
         genuinely unknown. Guessing ``todo`` here would resurrect a ``blocked``
         task as actionable — the exact lifecycle-guess that keeps ``undo_done``
         unsupported on this lane. Refuse and say so (no write).
+
+        NOTE THE ASYMMETRY, because it is the one this enumeration used to hide:
+        this branch catches provenance that is ABSENT. Provenance that is STALE
+        (present, well-formed, and wrong — the sequence above) is NOT caught
+        here and cannot be; it returns ``success`` with the wrong status.
       * ``success`` — restored (one write).
     """
     record_path = _resolve_task_path(
