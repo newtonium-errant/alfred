@@ -817,9 +817,13 @@ _ROUTINE_ITEM_TOOL_SCHEMA = {
         "naming the conflict + offer to add the clear flag\n"
         "  * 'duplicate_item' (add only) — text matches existing "
         "item; ask back\n"
-        "  * 'invalid_field' — operator-supplied value failed "
-        "validation (e.g. negative cadence days); tell the operator "
-        "the validation error\n"
+        "  * 'invalid_field' — either an operator-supplied VALUE failed "
+        "validation (e.g. negative cadence days), or a field NAME was "
+        "supplied that this tool cannot write (the payload's "
+        "``unsupported_fields`` list says which, and ``accepted_fields`` "
+        "says what it does take). NOTHING was written in either case. "
+        "Tell the operator what was refused — never report the change "
+        "as done\n"
         "\n"
         "Mutually-exclusive cadence: each item carries EITHER "
         "``target_cadence_days`` (soft, T3 auto-suggest) OR "
@@ -863,6 +867,15 @@ _ROUTINE_ITEM_TOOL_SCHEMA = {
                     "all active routines vault-wide."
                 ),
             },
+            # DRIFT WARNING: this enumeration is a SECOND spelling of
+            # ``alfred.routine.cli_items.ITEM_FIELD_SPECS``. It is not
+            # generated from the table because the schema is built at
+            # module-import time and the routine package is deliberately
+            # lazy-imported here. The equality is enforced instead by
+            # ``test_tool_schema_enumerates_every_registered_field``, which
+            # fails if a field is added to the table and not named here —
+            # a model that is never told a field exists will never send it,
+            # which is the same capability gap by a quieter route.
             "fields": {
                 "type": "object",
                 "description": (
@@ -872,14 +885,31 @@ _ROUTINE_ITEM_TOOL_SCHEMA = {
                     "``due_pattern`` (dict per DUE_PATTERN_TYPES; "
                     "hard cadence), ``surface_at_days`` (int > 0; "
                     "T2 ramp), ``escalate_at_days`` (int >= 0; T1 "
-                    "escalation), ``self_care`` (bool; routes the item "
+                    "escalation, days BEFORE DUE — requires "
+                    "due_pattern), ``escalate_after_gap_days`` (int > 0; "
+                    "T1 escalation + Duty visit, days SINCE LAST "
+                    "COMPLETION — requires NO due_pattern; this is the "
+                    "NEGLECT-GAP axis and is a DIFFERENT field from "
+                    "escalate_at_days), ``warn_after_gap_days`` (int > 0; "
+                    "routine-section annotation only, never changes "
+                    "tier), ``self_care`` (bool; routes the item "
                     "to the T3 self-care lane — intrinsic, never "
                     "deadline-escalates). 'edit'-only: ``text`` (new "
                     "item text — rename, migrates completion_log), "
                     "``clear_due_pattern`` (bool; switch hard → "
                     "soft), ``clear_target_cadence_days`` (bool; "
-                    "switch soft → hard). Omit entirely for 'remove' "
-                    "(no fields needed)."
+                    "switch soft → hard), "
+                    "``clear_escalate_after_gap_days`` (bool; switch "
+                    "neglect-gap axis → deadline axis). Omit entirely "
+                    "for 'remove' (no fields needed).\n"
+                    "\n"
+                    "Any OTHER key is REFUSED BY NAME with an "
+                    "'invalid_field' canary and nothing is written — the "
+                    "tool will never silently drop a field you set. If "
+                    "the refusal names a field you meant, resend with the "
+                    "corrected name; if the field genuinely is not "
+                    "writable here, tell the operator plainly rather than "
+                    "reporting the change as done."
                 ),
             },
         },
@@ -3270,17 +3300,26 @@ async def _dispatch_routine_item(
     ambiguous_item / cadence_conflict / duplicate_item /
     invalid_field) — Salem routes on it.
 
-    Argv build per action:
-      * add: ``[..., 'routine', 'item', 'add', record, text, --json,
-        + optional --priority / --target-cadence-days /
-        --due-pattern JSON / --surface-at-days / --escalate-at-days]``
+    Argv build per action. The optional flags are NOT enumerated here on
+    purpose — they are generated from
+    :data:`alfred.routine.cli_items.ITEM_FIELD_SPECS`, and a hand-copied
+    list in a docstring is exactly the kind of second spelling that falls
+    out of date and then reads as authoritative. Read the table.
+      * add: ``[..., 'routine', 'item', 'add', record, text, --json]``
+        + the add-eligible flags from the table
       * remove: ``[..., 'routine', 'item', 'remove', record, item,
         --json]`` (record may be empty → vault-wide fuzzy via the
-        one-positional form ``[..., 'remove', item, --json]``)
-      * edit: ``[..., 'routine', 'item', 'edit', record, item, --json,
-        + optional --text / --priority / --target-cadence-days /
-        --due-pattern JSON / --surface-at-days / --escalate-at-days /
-        --clear-due-pattern / --clear-target-cadence-days]``
+        one-positional form ``[..., 'remove', item, --json]``). Accepts
+        NO fields.
+      * edit: ``[..., 'routine', 'item', 'edit', record, item, --json]``
+        + the edit-eligible flags from the table
+
+    **A field this tool cannot write is REFUSED BY NAME, never dropped.**
+    Any key in ``fields`` outside the accepted set for the action returns
+    an ``invalid_field`` canary naming the offender (and its nearest
+    accepted neighbour, with both meanings spelled out) without spawning
+    the subprocess or touching the record. See the refusal block below for
+    the 2026-08-20 incident that motivated it.
     """
     import asyncio
     import json
@@ -3294,6 +3333,16 @@ async def _dispatch_routine_item(
     from alfred.routine.cli import (
         DONE_KIND_SUBPROCESS_ERROR,
         DONE_KIND_TIMEOUT,
+        ITEM_KIND_INVALID_FIELD,
+    )
+    # The accepted-field registry (2026-08-21) — ONE list, used below for
+    # BOTH the unsupported-field refusal and the argv build, so the set this
+    # dispatcher accepts and the set it actually threads cannot diverge.
+    from alfred.routine.cli_items import (
+        ITEM_FIELD_SPECS,
+        accepted_item_fields,
+        unsupported_fields_message,
+        unsupported_item_fields,
     )
 
     # --- Tool-set gating -------------------------------------------------
@@ -3342,6 +3391,51 @@ async def _dispatch_routine_item(
             ),
         })
 
+    # --- Unsupported-field REFUSAL (2026-08-21) --------------------------
+    #
+    # THE DEFECT THIS CLOSES. Before this gate, the loop below read a
+    # hand-written subset of ``fields`` and every other key fell on the
+    # floor. On 2026-08-20 the operator asked for a 7-day neglect-gap
+    # escalation on Pool Chemistry; ``escalate_after_gap_days`` was not in
+    # the subset; the item was written WITHOUT it and the tool answered
+    # ``ok=True``. Operator intent was discarded behind a success report —
+    # the precise inverse of the intentionally-left-blank rule, which asks
+    # that silence be distinguishable from success. Here silence WAS
+    # success.
+    #
+    # A field the tool cannot write is now a loud, NAMED refusal that
+    # changes nothing on disk. Refusing BEFORE the argv build (and so
+    # before the subprocess spawns) is deliberate: a partial write followed
+    # by an error is worse than no write at all, because the operator then
+    # has to work out which half landed. Pinned for zero side effects by
+    # ``test_unsupported_field_refusal_never_spawns_subprocess``.
+    unsupported = unsupported_item_fields(action, fields)
+    if unsupported:
+        message = unsupported_fields_message(action, unsupported)
+        log.warning(
+            "talker.routine_item.unsupported_field",
+            session_id=session.session_id,
+            action=action,
+            item=item[:200] if isinstance(item, str) else "",
+            unsupported_fields=unsupported,
+            accepted_fields=sorted(accepted_item_fields(action)),
+        )
+        return _dumps({
+            "ok": False,
+            "kind": ITEM_KIND_INVALID_FIELD,
+            "error": message,
+            # NON-EMPTY here by construction — this branch is guarded by
+            # ``if unsupported:``. The empty case is supplied on the
+            # CLI-canary path at the bottom of this function, which is what
+            # makes the key present on every verdict-carrying response and
+            # lets a consumer separate the two ``invalid_field`` causes
+            # (bad VALUE vs unwritable NAME) on the value rather than on
+            # the key's presence. Pinned by
+            # ``test_unsupported_fields_key_present_on_both_invalid_field_causes``.
+            "unsupported_fields": unsupported,
+            "accepted_fields": sorted(accepted_item_fields(action)),
+        })
+
     # --- Build argv ------------------------------------------------------
     argv: list[str] = [
         sys.executable, "-m", "alfred", "routine", "item", action,
@@ -3374,18 +3468,30 @@ async def _dispatch_routine_item(
     # --- Append --fields-style flags from the fields dict ---------------
     # The CLI accepts each field as its own --flag; we serialise back
     # from the operator's nested ``fields`` dict to the flag form.
+    #
+    # The scalar class is built MECHANICALLY from ``ITEM_FIELD_SPECS`` —
+    # the same table the refusal gate above consults. That is the point:
+    # the old hand-written tuple here is what dropped
+    # ``escalate_after_gap_days``, and a hand-written list can always fall
+    # one field behind the CLI it feeds. Adding a row to the table now
+    # threads the flag automatically. The three non-scalar encoders
+    # (due_pattern JSON, self_care's flag-pair, the edit-only control keys)
+    # still need their own serialisation and are handled explicitly below,
+    # but they are REGISTERED in the same table and
+    # ``test_every_registered_field_reaches_argv`` drives every row through
+    # this function to prove each one lands.
     if action in ("add", "edit"):
         priority = fields.get("priority")
         if isinstance(priority, str) and priority.strip():
             argv.extend(["--priority", priority.strip()])
-        for flag_name, field_key in (
-            ("--target-cadence-days", "target_cadence_days"),
-            ("--surface-at-days", "surface_at_days"),
-            ("--escalate-at-days", "escalate_at_days"),
-        ):
-            val = fields.get(field_key)
+        for spec in ITEM_FIELD_SPECS:
+            if spec.encoding != "value" or action not in spec.actions:
+                continue
+            if spec.name == "priority":
+                continue  # handled above (needs .strip() + str-guard)
+            val = fields.get(spec.name)
             if val is not None:
-                argv.extend([flag_name, str(val)])
+                argv.extend([spec.flag, str(val)])
         due_pattern = fields.get("due_pattern")
         if due_pattern is not None:
             # Always JSON-serialise the dict — the CLI's
@@ -3420,10 +3526,13 @@ async def _dispatch_routine_item(
         new_text = fields.get("text")
         if isinstance(new_text, str) and new_text.strip():
             argv.extend(["--text", new_text.strip()])
-        if fields.get("clear_due_pattern"):
-            argv.append("--clear-due-pattern")
-        if fields.get("clear_target_cadence_days"):
-            argv.append("--clear-target-cadence-days")
+        # ``switch`` encoders — bare presence flags, truthy-gated. Built
+        # from the table for the same reason as the scalar loop above.
+        for spec in ITEM_FIELD_SPECS:
+            if spec.encoding != "switch" or action not in spec.actions:
+                continue
+            if fields.get(spec.name):
+                argv.append(spec.flag)
 
     argv.append("--json")
 
@@ -3518,7 +3627,29 @@ async def _dispatch_routine_item(
             "kind": DONE_KIND_SUBPROCESS_ERROR,
         })
 
-    # --- Success/canary path: return parsed JSON verbatim ---------------
+    # --- Success/canary path: return the CLI's canary --------------------
+    #
+    # ``unsupported_fields`` is injected EMPTY here so the key is present on
+    # every CLI-canary response, not only on the name-refusal above. Without
+    # it the key would be conditionally present, and there are TWO distinct
+    # ``invalid_field`` causes: a bad field VALUE (raised by the CLI, arrives
+    # through this path) and an unwritable field NAME (refused above). A
+    # consumer separating them with ``payload["unsupported_fields"] == []``
+    # would hit a KeyError on the value cause.
+    #
+    # Per the intentionally-left-blank data-shape rule: an always-present
+    # field carrying an empty value beats one that appears only when
+    # populated, because absence cannot be told apart from a producer that
+    # never ran. The discriminator is now the VALUE (empty vs not), not the
+    # key's presence. ``setdefault`` so a future CLI that emits its own
+    # ``unsupported_fields`` wins rather than being silently overwritten.
+    #
+    # Scope of the guarantee, stated exactly: this covers every response
+    # carrying a tool VERDICT — the name-refusal plus every CLI canary.
+    # The transport-failure returns (timeout / crash / no-canary) and the
+    # early argument-validation errors carry no verdict and no such key;
+    # those are distinguishable by their own ``kind`` values.
+    parsed.setdefault("unsupported_fields", [])
     log.info(
         "talker.routine_item.result",
         session_id=session.session_id,

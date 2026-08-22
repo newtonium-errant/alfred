@@ -2000,6 +2000,12 @@ def cmd_routine(args: argparse.Namespace) -> None:
                     escalate_at_days=getattr(
                         args, "escalate_at_days", None,
                     ),
+                    escalate_after_gap_days=getattr(
+                        args, "escalate_after_gap_days", None,
+                    ),
+                    warn_after_gap_days=getattr(
+                        args, "warn_after_gap_days", None,
+                    ),
                     due_pattern=getattr(args, "due_pattern", None),
                     self_care=getattr(args, "self_care", None),
                 )
@@ -2040,6 +2046,12 @@ def cmd_routine(args: argparse.Namespace) -> None:
                         escalate_at_days=getattr(
                             args, "escalate_at_days", None,
                         ),
+                        escalate_after_gap_days=getattr(
+                            args, "escalate_after_gap_days", None,
+                        ),
+                        warn_after_gap_days=getattr(
+                            args, "warn_after_gap_days", None,
+                        ),
                         due_pattern=getattr(args, "due_pattern", None),
                         self_care=getattr(args, "self_care", None),
                         clear_due_pattern=getattr(
@@ -2047,6 +2059,9 @@ def cmd_routine(args: argparse.Namespace) -> None:
                         ),
                         clear_target_cadence_days=getattr(
                             args, "clear_target_cadence_days", False,
+                        ),
+                        clear_escalate_after_gap_days=getattr(
+                            args, "clear_escalate_after_gap_days", False,
                         ),
                     )
             else:
@@ -6904,6 +6919,28 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     item_add.add_argument(
+        "--escalate-after-gap-days",
+        dest="escalate_after_gap_days",
+        type=int, default=None,
+        help=(
+            "NEGLECT-GAP escalation threshold: days SINCE LAST COMPLETION "
+            "after which the item goes T1 and visits Duty for the day. "
+            "Requires NO --due-pattern. NOT the same as "
+            "--escalate-at-days, which is days BEFORE DUE on a "
+            "deadline item. Composes with --target-cadence-days."
+        ),
+    )
+    item_add.add_argument(
+        "--warn-after-gap-days",
+        dest="warn_after_gap_days",
+        type=int, default=None,
+        help=(
+            "Annotation threshold: days since last completion after which "
+            "the routine section flags the item. Annotation only — never "
+            "changes the item's tier."
+        ),
+    )
+    item_add.add_argument(
         "--self-care", dest="self_care",
         action="store_true", default=None,
         help=(
@@ -7001,6 +7038,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--escalate-at-days",
         dest="escalate_at_days",
         type=int, default=None,
+        help=(
+            "DEADLINE-axis escalation: days BEFORE DUE (0 = on the due "
+            "date). Requires --due-pattern."
+        ),
+    )
+    item_edit.add_argument(
+        "--escalate-after-gap-days",
+        dest="escalate_after_gap_days",
+        type=int, default=None,
+        help=(
+            "NEGLECT-GAP escalation threshold: days SINCE LAST COMPLETION "
+            "after which the item goes T1 and visits Duty for the day. "
+            "Requires NO due_pattern. NOT the same as --escalate-at-days, "
+            "which is days BEFORE DUE. Composes with "
+            "--target-cadence-days."
+        ),
+    )
+    item_edit.add_argument(
+        "--warn-after-gap-days",
+        dest="warn_after_gap_days",
+        type=int, default=None,
+        help=(
+            "Annotation threshold: days since last completion after which "
+            "the routine section flags the item. Annotation only — never "
+            "changes the item's tier."
+        ),
     )
     item_edit.add_argument(
         "--clear-due-pattern",
@@ -7009,7 +7072,19 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Strip due_pattern + escalate_at_days + surface_at_days "
             "from the item. Required when switching hard → soft "
-            "cadence (operator opt-in for the mode change)."
+            "cadence (operator opt-in for the mode change). Leaves "
+            "escalate_after_gap_days intact — that field only takes "
+            "effect once the deadline is gone."
+        ),
+    )
+    item_edit.add_argument(
+        "--clear-escalate-after-gap-days",
+        dest="clear_escalate_after_gap_days",
+        action="store_true", default=False,
+        help=(
+            "Strip escalate_after_gap_days from the item. Required when "
+            "putting a --due-pattern on an item that had neglect-gap "
+            "escalation (deadline axis and gap axis are exclusive)."
         ),
     )
     item_edit.add_argument(
